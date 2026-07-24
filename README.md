@@ -1,4 +1,4 @@
-# SIGMA LIVE SERVER 1.0
+# SIGMA LIVE SERVER 1.1
 
 Servidor Node.js que coleta os eventos ao vivo do Blaze Double e fornece uma API para o SIGMA ORION.
 
@@ -30,3 +30,12 @@ Use Node, branch `main`, diretório raiz vazio, `npm install` para build e `npm 
 Depois do deploy, abra `/health`. O campo `rounds` começa em zero e deve aumentar após resultados completos.
 
 Observação: o plano gratuito do Render pode suspender o serviço após um período sem acessos.
+
+
+## Correções da versão 1.1
+
+- envia o comando de inscrição para `double_room_1`;
+- envia ping Engine.IO v3 (`2`) no intervalo informado pelo handshake;
+- reconhece o pong (`3`);
+- evita que a Blaze encerre a conexão por ausência de heartbeat;
+- expõe `subscribed`, `room`, `pingIntervalMs` e `pingTimeoutMs` em `/health`.

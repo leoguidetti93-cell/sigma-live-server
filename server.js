@@ -31,7 +31,7 @@ app.use(express.json({ limit: "100kb" }));
 app.get("/", (_req, res) => {
   res.json({
     name: "SIGMA LIVE SERVER",
-    version: "1.0.0",
+    version: "1.1.0",
     online: true,
     endpoints: ["/health", "/last", "/memory", "/stats", "/events"]
   });
@@ -42,7 +42,7 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "sigma-live-server",
-    version: "1.0.0",
+    version: "1.1.0",
     timestamp: new Date().toISOString(),
     connected: state.connected,
     engineOpened: state.engineOpened,

@@ -1,8 +1,8 @@
 {
   "name": "sigma-live-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Servidor coletor do SIGMA ORION para resultados ao vivo do Blaze Double.",
+  "description": "SIGMA LIVE SERVER com inscrição double_room_1 e heartbeat Engine.IO v3.",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
