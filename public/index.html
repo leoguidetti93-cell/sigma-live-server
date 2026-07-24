@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#090a0f">
+  <title>SIGMA ACCESS</title>
+  <link rel="stylesheet" href="/admin/css/style.css">
+</head>
+<body>
+  <div id="loginScreen" class="login-screen">
+    <section class="login-card">
+      <div class="brand-mark">Σ</div>
+      <p class="eyebrow">SIGMA CORE</p>
+      <h1>SIGMA ACCESS</h1>
+      <p class="muted">Painel administrativo de licenças</p>
+      <form id="loginForm" class="stack">
+        <label for="adminToken">Token administrativo</label>
+        <div class="password-wrap">
+          <input id="adminToken" type="password" autocomplete="current-password" placeholder="Digite o SIGMA_ADMIN_TOKEN" required>
+          <button id="toggleToken" class="icon-button" type="button" aria-label="Mostrar ou ocultar token">◉</button>
+        </div>
+        <button class="primary-button" type="submit">ENTRAR NO PAINEL</button>
+      </form>
+      <p id="loginMessage" class="form-message" aria-live="polite"></p>
+      <small>O token fica salvo somente nesta sessão do navegador.</small>
+    </section>
+  </div>
+
+  <div id="appShell" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="brand-mark small">Σ</div>
+        <div><strong>SIGMA</strong><span>ACCESS</span></div>
+      </div>
+      <nav class="nav-list" aria-label="Navegação principal">
+        <button class="nav-item active" data-view="dashboard"><span>⌂</span>Dashboard</button>
+        <button class="nav-item" data-view="licenses"><span>⌁</span>Licenças</button>
+        <button class="nav-item" data-view="new-license"><span>＋</span>Nova licença</button>
+      </nav>
+      <div class="sidebar-footer">
+        <div id="connectionBadge" class="status-badge"><i></i>Verificando</div>
+        <button id="logoutButton" class="ghost-button">Sair</button>
+        <small>SIGMA ACCESS v0.1.0<br>Powered by SIGMA CORE</small>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <button id="menuButton" class="menu-button" aria-label="Abrir menu">☰</button>
+        <div><p class="eyebrow">CONTROLE CENTRAL</p><h2 id="pageTitle">Dashboard</h2></div>
+        <button id="refreshButton" class="ghost-button">↻ Atualizar</button>
+      </header>
+
+      <section id="dashboardView" class="view active-view">
+        <div class="stats-grid">
+          <article class="stat-card"><span>Total de licenças</span><strong id="statTotal">—</strong><small>Cadastradas no sistema</small></article>
+          <article class="stat-card"><span>Ativas</span><strong id="statActive">—</strong><small>ACTIVE ou NEW</small></article>
+          <article class="stat-card"><span>Trials</span><strong id="statTrials">—</strong><small>Plano de avaliação</small></article>
+          <article class="stat-card"><span>Bloqueadas</span><strong id="statBlocked">—</strong><small>Acesso suspenso</small></article>
+        </div>
+        <div class="panel-grid">
+          <article class="panel">
+            <div class="panel-header"><div><p class="eyebrow">ACESSO RÁPIDO</p><h3>Gerar nova licença</h3></div><button class="primary-button compact" data-go="new-license">＋ Nova chave</button></div>
+            <p class="muted">Crie uma chave automática de seis caracteres, sem letras ou números ambíguos.</p>
+          </article>
+          <article class="panel">
+            <div class="panel-header"><div><p class="eyebrow">ÚLTIMO REGISTRO</p><h3 id="latestName">Nenhuma licença</h3></div><span id="latestStatus" class="pill neutral">—</span></div>
+            <div class="latest-key"><code id="latestKey">------</code><button id="copyLatestButton" class="ghost-button" disabled>Copiar</button></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="licensesView" class="view">
+        <article class="panel">
+          <div class="panel-header wrap">
+            <div><p class="eyebrow">GERENCIAMENTO</p><h3>Licenças cadastradas</h3></div>
+            <button class="primary-button compact" data-go="new-license">＋ Nova licença</button>
+          </div>
+          <div class="filters">
+            <input id="searchInput" type="search" placeholder="Buscar por nome ou chave">
+            <select id="planFilter"><option value="">Todos os planos</option><option>TRIAL</option><option>MENSAL</option><option>TRIMESTRAL</option><option>SEMESTRAL</option><option>ANUAL</option><option>VITALICIO</option></select>
+            <select id="statusFilter"><option value="">Todos os status</option><option>NEW</option><option>ACTIVE</option><option>EXPIRED</option><option>BLOCKED</option></select>
+          </div>
+          <div class="table-wrap">
+            <table><thead><tr><th>Cliente</th><th>Chave</th><th>Plano</th><th>Status</th><th>Expiração</th><th>Ações</th></tr></thead><tbody id="licensesTableBody"></tbody></table>
+            <div id="emptyState" class="empty-state hidden">Nenhuma licença encontrada.</div>
+          </div>
+        </article>
+      </section>
+
+      <section id="newLicenseView" class="view">
+        <div class="form-layout">
+          <article class="panel form-panel">
+            <p class="eyebrow">NOVA CHAVE</p><h3>Gerar licença</h3>
+            <form id="licenseForm" class="stack">
+              <label for="displayName">Nome do cliente</label>
+              <input id="displayName" name="display_name" maxlength="100" placeholder="Ex.: Leonardo" required>
+              <label for="plan">Plano</label>
+              <select id="plan" name="plan"><option>TRIAL</option><option>MENSAL</option><option>TRIMESTRAL</option><option>SEMESTRAL</option><option>ANUAL</option><option>VITALICIO</option></select>
+              <button id="generateButton" class="primary-button" type="submit">GERAR LICENÇA</button>
+            </form>
+            <p id="licenseMessage" class="form-message" aria-live="polite"></p>
+          </article>
+          <article id="resultCard" class="panel result-card muted-card">
+            <p class="eyebrow">ÚLTIMA LICENÇA CRIADA</p><h3 id="resultName">Aguardando geração</h3>
+            <div class="generated-key"><code id="resultKey">------</code></div>
+            <div class="result-meta"><span id="resultPlan" class="pill neutral">PLANO</span><span id="resultStatus" class="pill neutral">STATUS</span></div>
+            <button id="copyResultButton" class="ghost-button wide" disabled>Copiar chave</button>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/admin/js/app.js" defer></script>
+</body>
+</html>

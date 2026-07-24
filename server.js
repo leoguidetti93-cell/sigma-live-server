@@ -2,13 +2,14 @@
 
 const express = require("express");
 const cors = require("cors");
+const path = require("path");
 const { createClient } = require("@supabase/supabase-js");
 
 const config = require("./config");
 const RoundMemory = require("./memory");
 const BlazeLiveSocket = require("./socket");
 
-const APP_VERSION = "1.2.0";
+const APP_VERSION = "1.3.0";
 const ACCESS_TABLE = "sigma_access";
 const LICENSE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LICENSE_LENGTH = 6;
@@ -74,6 +75,12 @@ app.use(
 );
 
 app.use(express.json({ limit: "100kb" }));
+
+const adminPublicDir = path.join(__dirname, "public");
+app.use("/admin", express.static(adminPublicDir, { index: false, maxAge: "1h" }));
+app.get(["/admin", "/admin/"], (_req, res) => {
+  res.sendFile(path.join(adminPublicDir, "index.html"));
+});
 
 function normalizeText(value, maxLength = 100) {
   return String(value || "")
@@ -193,6 +200,8 @@ app.get("/", (_req, res) => {
       "/stats",
       "/events",
       "/access/health",
+      "/admin",
+      "/api/access/admin/summary",
       "/api/access/licenses"
     ]
   });
@@ -259,6 +268,64 @@ app.get(
         message:
           error?.message ||
           "Não foi possível consultar a tabela sigma_access."
+      });
+    }
+  }
+);
+
+
+app.get(
+  "/api/access/admin/summary",
+  requireSupabase,
+  requireAdminToken,
+  async (_req, res) => {
+    try {
+      const { data, error } = await supabase
+        .from(ACCESS_TABLE)
+        .select("status, plan");
+
+      if (error) throw error;
+
+      const rows = data || [];
+      const summary = {
+        total: rows.length,
+        active: rows.filter(item => ["NEW", "ACTIVE"].includes(item.status)).length,
+        trials: rows.filter(item => item.plan === "TRIAL").length,
+        blocked: rows.filter(item => item.status === "BLOCKED").length,
+        expired: rows.filter(item => item.status === "EXPIRED").length
+      };
+
+      res.json({ ok: true, summary });
+    } catch (error) {
+      console.error("[SIGMA ACCESS] Erro no resumo:", error);
+      res.status(500).json({
+        ok: false,
+        error: "SUMMARY_ERROR",
+        message: error?.message || "Não foi possível carregar o resumo."
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/access/licenses",
+  requireSupabase,
+  requireAdminToken,
+  async (_req, res) => {
+    try {
+      const { data, error } = await supabase
+        .from(ACCESS_TABLE)
+        .select("id, created_at, license_key, display_name, status, plan, first_access, expires_at, current_session, current_device, last_seen, grace_until")
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+      res.json({ ok: true, licenses: data || [] });
+    } catch (error) {
+      console.error("[SIGMA ACCESS] Erro ao listar licenças:", error);
+      res.status(500).json({
+        ok: false,
+        error: "LICENSE_LIST_ERROR",
+        message: error?.message || "Não foi possível listar as licenças."
       });
     }
   }
@@ -334,6 +401,73 @@ app.post(
           error?.message ||
           "Não foi possível gerar a licença."
       });
+    }
+  }
+);
+
+
+app.patch(
+  "/api/access/licenses/:id",
+  requireSupabase,
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const id = normalizeText(req.params.id, 80);
+      const updates = {};
+
+      if (req.body?.status !== undefined) {
+        const status = normalizeText(req.body.status, 20).toUpperCase();
+        const allowed = ["NEW", "ACTIVE", "EXPIRED", "BLOCKED"];
+        if (!allowed.includes(status)) {
+          return res.status(400).json({ ok: false, error: "INVALID_STATUS", message: "Status inválido." });
+        }
+        updates.status = status;
+      }
+
+      if (req.body?.plan !== undefined) updates.plan = normalizePlan(req.body.plan);
+      if (req.body?.display_name !== undefined) {
+        const displayName = normalizeText(req.body.display_name, 100);
+        if (!displayName) return res.status(400).json({ ok: false, error: "DISPLAY_NAME_REQUIRED", message: "Informe o nome do cliente." });
+        updates.display_name = displayName;
+      }
+
+      if (req.body?.expires_at !== undefined) {
+        updates.expires_at = req.body.expires_at ? new Date(req.body.expires_at).toISOString() : null;
+      }
+
+      if (!Object.keys(updates).length) {
+        return res.status(400).json({ ok: false, error: "NO_CHANGES", message: "Nenhuma alteração válida foi informada." });
+      }
+
+      const { data, error } = await supabase
+        .from(ACCESS_TABLE)
+        .update(updates)
+        .eq("id", id)
+        .select("id, created_at, license_key, display_name, status, plan, expires_at")
+        .single();
+
+      if (error) throw error;
+      res.json({ ok: true, message: "Licença atualizada.", license: data });
+    } catch (error) {
+      console.error("[SIGMA ACCESS] Erro ao atualizar licença:", error);
+      res.status(500).json({ ok: false, error: "LICENSE_UPDATE_ERROR", message: error?.message || "Não foi possível atualizar a licença." });
+    }
+  }
+);
+
+app.delete(
+  "/api/access/licenses/:id",
+  requireSupabase,
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const id = normalizeText(req.params.id, 80);
+      const { error } = await supabase.from(ACCESS_TABLE).delete().eq("id", id);
+      if (error) throw error;
+      res.json({ ok: true, message: "Licença excluída." });
+    } catch (error) {
+      console.error("[SIGMA ACCESS] Erro ao excluir licença:", error);
+      res.status(500).json({ ok: false, error: "LICENSE_DELETE_ERROR", message: error?.message || "Não foi possível excluir a licença." });
     }
   }
 );
