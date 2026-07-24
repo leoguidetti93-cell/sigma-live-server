@@ -10,7 +10,7 @@ const config = require("./config");
 const RoundMemory = require("./memory");
 const BlazeLiveSocket = require("./socket");
 
-const APP_VERSION = "1.4.0";
+const APP_VERSION = "1.4.1";
 const ACCESS_TABLE = "sigma_access";
 const LICENSE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LICENSE_LENGTH = 6;
@@ -102,6 +102,23 @@ function normalizePlan(value) {
   ];
 
   return allowedPlans.includes(plan) ? plan : "TRIAL";
+}
+
+function calculateLicenseExpiration(plan, baseDate = new Date()) {
+  const daysByPlan = {
+    TRIAL: 7,
+    MENSAL: 30,
+    TRIMESTRAL: 90,
+    SEMESTRAL: 180,
+    ANUAL: 365
+  };
+
+  if (plan === "VITALICIO") return null;
+
+  const days = daysByPlan[plan] || daysByPlan.TRIAL;
+  const expiration = new Date(baseDate);
+  expiration.setUTCDate(expiration.getUTCDate() + days);
+  return expiration.toISOString();
 }
 
 function generateLicenseKey() {
@@ -520,6 +537,7 @@ app.post(
       }
 
       const licenseKey = await createUniqueLicenseKey();
+      const expiresAt = calculateLicenseExpiration(plan);
 
       const { data, error } = await supabase
         .from(ACCESS_TABLE)
@@ -529,14 +547,14 @@ app.post(
           status: "NEW",
           plan,
           first_access: null,
-          expires_at: null,
+          expires_at: expiresAt,
           current_session: null,
           current_device: null,
           last_seen: null,
           grace_until: null
         })
         .select(
-          "id, created_at, license_key, display_name, status, plan"
+          "id, created_at, license_key, display_name, status, plan, expires_at"
         )
         .single();
 
