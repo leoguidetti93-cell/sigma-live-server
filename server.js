@@ -3,13 +3,14 @@
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
+const crypto = require("crypto");
 const { createClient } = require("@supabase/supabase-js");
 
 const config = require("./config");
 const RoundMemory = require("./memory");
 const BlazeLiveSocket = require("./socket");
 
-const APP_VERSION = "1.3.0";
+const APP_VERSION = "1.4.0";
 const ACCESS_TABLE = "sigma_access";
 const LICENSE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LICENSE_LENGTH = 6;
@@ -158,6 +159,36 @@ function requireAdminToken(req, res, next) {
   next();
 }
 
+
+function normalizeLicenseKey(value) {
+  return normalizeText(value, 30).toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function normalizeDeviceId(value) {
+  return normalizeText(value, 120).replace(/[^a-zA-Z0-9_-]/g, "");
+}
+
+function publicLicensePayload(row) {
+  return {
+    display_name: row.display_name,
+    plan: row.plan,
+    status: row.status,
+    expires_at: row.expires_at,
+    first_access: row.first_access,
+    last_seen: row.last_seen
+  };
+}
+
+function licenseFailure(res, statusCode, error, message) {
+  return res.status(statusCode).json({ ok: false, error, message });
+}
+
+function isExpired(expiresAt) {
+  if (!expiresAt) return false;
+  const time = new Date(expiresAt).getTime();
+  return Number.isFinite(time) && time <= Date.now();
+}
+
 async function createUniqueLicenseKey(maxAttempts = 10) {
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const licenseKey = generateLicenseKey();
@@ -201,6 +232,9 @@ app.get("/", (_req, res) => {
       "/events",
       "/access/health",
       "/admin",
+      "/api/access/activate",
+      "/api/access/validate",
+      "/api/access/deactivate",
       "/api/access/admin/summary",
       "/api/access/licenses"
     ]
@@ -273,6 +307,137 @@ app.get(
   }
 );
 
+
+
+app.post(
+  "/api/access/activate",
+  requireSupabase,
+  async (req, res) => {
+    try {
+      const licenseKey = normalizeLicenseKey(req.body?.license_key);
+      const deviceId = normalizeDeviceId(req.body?.device_id);
+      const deviceName = normalizeText(req.body?.device_name || "Navegador", 120);
+
+      if (!licenseKey || !deviceId) {
+        return licenseFailure(res, 400, "ACTIVATION_DATA_REQUIRED", "Informe a licença e o dispositivo.");
+      }
+
+      const { data: license, error } = await supabase
+        .from(ACCESS_TABLE)
+        .select("id, license_key, display_name, status, plan, first_access, expires_at, current_session, current_device, last_seen")
+        .eq("license_key", licenseKey)
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!license) return licenseFailure(res, 404, "LICENSE_NOT_FOUND", "Licença não encontrada.");
+      if (license.status === "BLOCKED") return licenseFailure(res, 403, "LICENSE_BLOCKED", "Esta licença foi bloqueada.");
+      if (license.status === "EXPIRED" || isExpired(license.expires_at)) {
+        if (license.status !== "EXPIRED") await supabase.from(ACCESS_TABLE).update({ status: "EXPIRED" }).eq("id", license.id);
+        return licenseFailure(res, 403, "LICENSE_EXPIRED", "Esta licença está expirada.");
+      }
+      if (license.current_device && license.current_device !== deviceId) {
+        return licenseFailure(res, 409, "DEVICE_MISMATCH", "Esta licença já está vinculada a outro dispositivo.");
+      }
+
+      const now = new Date().toISOString();
+      const sessionId = crypto.randomUUID();
+      const updates = {
+        status: "ACTIVE",
+        first_access: license.first_access || now,
+        current_device: deviceId,
+        current_session: sessionId,
+        last_seen: now,
+        grace_until: null
+      };
+
+      const { data: updated, error: updateError } = await supabase
+        .from(ACCESS_TABLE)
+        .update(updates)
+        .eq("id", license.id)
+        .select("display_name, plan, status, expires_at, first_access, last_seen")
+        .single();
+      if (updateError) throw updateError;
+
+      console.log(`[SIGMA ACCESS] Ativação: ${licenseKey} | ${deviceName} | ${deviceId}`);
+      res.json({ ok: true, message: "Licença ativada.", session_id: sessionId, license: publicLicensePayload(updated) });
+    } catch (error) {
+      console.error("[SIGMA ACCESS] Erro na ativação:", error);
+      res.status(500).json({ ok: false, error: "ACTIVATION_ERROR", message: error?.message || "Não foi possível ativar a licença." });
+    }
+  }
+);
+
+app.post(
+  "/api/access/validate",
+  requireSupabase,
+  async (req, res) => {
+    try {
+      const licenseKey = normalizeLicenseKey(req.body?.license_key);
+      const deviceId = normalizeDeviceId(req.body?.device_id);
+      const sessionId = normalizeText(req.body?.session_id, 120);
+      if (!licenseKey || !deviceId || !sessionId) return licenseFailure(res, 400, "VALIDATION_DATA_REQUIRED", "Dados de validação incompletos.");
+
+      const { data: license, error } = await supabase
+        .from(ACCESS_TABLE)
+        .select("id, display_name, status, plan, first_access, expires_at, current_session, current_device, last_seen")
+        .eq("license_key", licenseKey)
+        .maybeSingle();
+      if (error) throw error;
+      if (!license) return licenseFailure(res, 404, "LICENSE_NOT_FOUND", "Licença não encontrada.");
+      if (license.status === "BLOCKED") return licenseFailure(res, 403, "LICENSE_BLOCKED", "Esta licença foi bloqueada.");
+      if (license.status === "EXPIRED" || isExpired(license.expires_at)) {
+        if (license.status !== "EXPIRED") await supabase.from(ACCESS_TABLE).update({ status: "EXPIRED" }).eq("id", license.id);
+        return licenseFailure(res, 403, "LICENSE_EXPIRED", "Esta licença está expirada.");
+      }
+      if (license.current_device !== deviceId || license.current_session !== sessionId) {
+        return licenseFailure(res, 401, "SESSION_INVALID", "Sessão inválida. Ative a licença novamente.");
+      }
+
+      const now = new Date().toISOString();
+      const { data: updated, error: updateError } = await supabase
+        .from(ACCESS_TABLE)
+        .update({ status: "ACTIVE", last_seen: now, grace_until: null })
+        .eq("id", license.id)
+        .select("display_name, plan, status, expires_at, first_access, last_seen")
+        .single();
+      if (updateError) throw updateError;
+      res.json({ ok: true, valid: true, license: publicLicensePayload(updated) });
+    } catch (error) {
+      console.error("[SIGMA ACCESS] Erro na validação:", error);
+      res.status(500).json({ ok: false, error: "VALIDATION_ERROR", message: error?.message || "Não foi possível validar a licença." });
+    }
+  }
+);
+
+app.post(
+  "/api/access/deactivate",
+  requireSupabase,
+  async (req, res) => {
+    try {
+      const licenseKey = normalizeLicenseKey(req.body?.license_key);
+      const deviceId = normalizeDeviceId(req.body?.device_id);
+      const sessionId = normalizeText(req.body?.session_id, 120);
+      if (!licenseKey || !deviceId || !sessionId) return licenseFailure(res, 400, "DEACTIVATION_DATA_REQUIRED", "Dados incompletos.");
+
+      const { data: license, error } = await supabase
+        .from(ACCESS_TABLE)
+        .select("id, current_device, current_session, status")
+        .eq("license_key", licenseKey)
+        .maybeSingle();
+      if (error) throw error;
+      if (!license) return licenseFailure(res, 404, "LICENSE_NOT_FOUND", "Licença não encontrada.");
+      if (license.current_device !== deviceId || license.current_session !== sessionId) return licenseFailure(res, 401, "SESSION_INVALID", "Sessão inválida.");
+
+      const nextStatus = license.status === "BLOCKED" ? "BLOCKED" : "ACTIVE";
+      const { error: updateError } = await supabase.from(ACCESS_TABLE).update({ current_session: null, current_device: null, last_seen: new Date().toISOString(), status: nextStatus }).eq("id", license.id);
+      if (updateError) throw updateError;
+      res.json({ ok: true, message: "Dispositivo desvinculado." });
+    } catch (error) {
+      console.error("[SIGMA ACCESS] Erro ao desvincular:", error);
+      res.status(500).json({ ok: false, error: "DEACTIVATION_ERROR", message: error?.message || "Não foi possível desvincular." });
+    }
+  }
+);
 
 app.get(
   "/api/access/admin/summary",
