@@ -2,13 +2,41 @@
 
 const express = require("express");
 const cors = require("cors");
+const { createClient } = require("@supabase/supabase-js");
+
 const config = require("./config");
 const RoundMemory = require("./memory");
 const BlazeLiveSocket = require("./socket");
 
+const APP_VERSION = "1.2.0";
+const ACCESS_TABLE = "sigma_access";
+const LICENSE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const LICENSE_LENGTH = 6;
+
 const app = express();
 const memory = new RoundMemory(config.memoryLimit);
 const clients = new Set();
+
+const supabaseUrl = String(process.env.SUPABASE_URL || "").trim();
+const supabaseSecretKey = String(
+  process.env.SUPABASE_SECRET_KEY || ""
+).trim();
+
+const sigmaAdminToken = String(
+  process.env.SIGMA_ADMIN_TOKEN || ""
+).trim();
+
+const supabase =
+  supabaseUrl && supabaseSecretKey
+    ? createClient(supabaseUrl, supabaseSecretKey, {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+          detectSessionInUrl: false
+        }
+      })
+    : null;
+
 const live = new BlazeLiveSocket({
   url: config.blazeSocketUrl,
   origin: config.blazeOrigin,
@@ -18,31 +46,165 @@ const live = new BlazeLiveSocket({
 });
 
 function corsOrigin(origin, callback) {
-  if (!origin || config.allowedOrigins.includes("*") || config.allowedOrigins.includes(origin)) {
+  if (
+    !origin ||
+    config.allowedOrigins.includes("*") ||
+    config.allowedOrigins.includes(origin)
+  ) {
     callback(null, true);
     return;
   }
-  callback(new Error("Origin não autorizado pelo SIGMA LIVE SERVER."));
+
+  callback(
+    new Error("Origin não autorizado pelo SIGMA LIVE SERVER.")
+  );
 }
 
-app.use(cors({ origin: corsOrigin, methods: ["GET", "OPTIONS"], credentials: false }));
+app.use(
+  cors({
+    origin: corsOrigin,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Sigma-Admin-Token"
+    ],
+    credentials: false
+  })
+);
+
 app.use(express.json({ limit: "100kb" }));
+
+function normalizeText(value, maxLength = 100) {
+  return String(value || "")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function normalizePlan(value) {
+  const plan = normalizeText(value || "TRIAL", 30).toUpperCase();
+
+  const allowedPlans = [
+    "TRIAL",
+    "MENSAL",
+    "TRIMESTRAL",
+    "SEMESTRAL",
+    "ANUAL",
+    "VITALICIO"
+  ];
+
+  return allowedPlans.includes(plan) ? plan : "TRIAL";
+}
+
+function generateLicenseKey() {
+  let key = "";
+
+  for (let index = 0; index < LICENSE_LENGTH; index += 1) {
+    const randomIndex = Math.floor(
+      Math.random() * LICENSE_CHARACTERS.length
+    );
+
+    key += LICENSE_CHARACTERS[randomIndex];
+  }
+
+  return key;
+}
+
+function requireSupabase(_req, res, next) {
+  if (!supabase) {
+    res.status(503).json({
+      ok: false,
+      error: "SUPABASE_NOT_CONFIGURED",
+      message:
+        "A conexão do SIGMA ACCESS com o Supabase não está configurada."
+    });
+    return;
+  }
+
+  next();
+}
+
+function requireAdminToken(req, res, next) {
+  if (!sigmaAdminToken) {
+    res.status(503).json({
+      ok: false,
+      error: "ADMIN_TOKEN_NOT_CONFIGURED",
+      message:
+        "A variável SIGMA_ADMIN_TOKEN ainda não foi configurada no Render."
+    });
+    return;
+  }
+
+  const receivedToken = String(
+    req.headers["x-sigma-admin-token"] || ""
+  ).trim();
+
+  if (!receivedToken || receivedToken !== sigmaAdminToken) {
+    res.status(401).json({
+      ok: false,
+      error: "UNAUTHORIZED",
+      message: "Token administrativo inválido."
+    });
+    return;
+  }
+
+  next();
+}
+
+async function createUniqueLicenseKey(maxAttempts = 10) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const licenseKey = generateLicenseKey();
+
+    const { data, error } = await supabase
+      .from(ACCESS_TABLE)
+      .select("id")
+      .eq("license_key", licenseKey)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(
+        `Falha ao verificar chave existente: ${error.message}`
+      );
+    }
+
+    if (!data) {
+      return licenseKey;
+    }
+  }
+
+  throw new Error(
+    "Não foi possível gerar uma chave única após várias tentativas."
+  );
+}
 
 app.get("/", (_req, res) => {
   res.json({
     name: "SIGMA LIVE SERVER",
-    version: "1.1.0",
+    version: APP_VERSION,
     online: true,
-    endpoints: ["/health", "/last", "/memory", "/stats", "/events"]
+    sigmaAccess: {
+      configured: Boolean(supabase),
+      adminConfigured: Boolean(sigmaAdminToken)
+    },
+    endpoints: [
+      "/health",
+      "/last",
+      "/memory",
+      "/stats",
+      "/events",
+      "/access/health",
+      "/api/access/licenses"
+    ]
   });
 });
 
 app.get("/health", (_req, res) => {
   const state = live.state();
+
   res.json({
     ok: true,
     service: "sigma-live-server",
-    version: "1.1.0",
+    version: APP_VERSION,
     timestamp: new Date().toISOString(),
     connected: state.connected,
     engineOpened: state.engineOpened,
@@ -54,35 +216,205 @@ app.get("/health", (_req, res) => {
     lastDisconnectedAt: state.lastDisconnectedAt,
     lastMessageAt: state.lastMessageAt,
     lastError: state.lastError,
-    reconnectAttempt: state.reconnectAttempt
+    reconnectAttempt: state.reconnectAttempt,
+    sigmaAccessConfigured: Boolean(supabase),
+    sigmaAdminConfigured: Boolean(sigmaAdminToken)
   });
 });
 
-app.get("/last", (_req, res) => res.json({ ok: true, round: memory.last() }));
+app.get(
+  "/access/health",
+  requireSupabase,
+  async (_req, res) => {
+    try {
+      const { count, error } = await supabase
+        .from(ACCESS_TABLE)
+        .select("id", {
+          count: "exact",
+          head: true
+        });
+
+      if (error) {
+        throw error;
+      }
+
+      res.json({
+        ok: true,
+        service: "sigma-access",
+        version: APP_VERSION,
+        database: "connected",
+        table: ACCESS_TABLE,
+        licenses: count || 0,
+        timestamp: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error(
+        "[SIGMA ACCESS] Erro no teste de conexão:",
+        error
+      );
+
+      res.status(500).json({
+        ok: false,
+        error: "SUPABASE_CONNECTION_ERROR",
+        message:
+          error?.message ||
+          "Não foi possível consultar a tabela sigma_access."
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/access/licenses",
+  requireSupabase,
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const displayName = normalizeText(
+        req.body?.display_name,
+        100
+      );
+
+      const plan = normalizePlan(req.body?.plan);
+
+      if (!displayName) {
+        res.status(400).json({
+          ok: false,
+          error: "DISPLAY_NAME_REQUIRED",
+          message:
+            "Informe o nome do cliente em display_name."
+        });
+        return;
+      }
+
+      const licenseKey = await createUniqueLicenseKey();
+
+      const { data, error } = await supabase
+        .from(ACCESS_TABLE)
+        .insert({
+          license_key: licenseKey,
+          display_name: displayName,
+          status: "NEW",
+          plan,
+          first_access: null,
+          expires_at: null,
+          current_session: null,
+          current_device: null,
+          last_seen: null,
+          grace_until: null
+        })
+        .select(
+          "id, created_at, license_key, display_name, status, plan"
+        )
+        .single();
+
+      if (error) {
+        throw error;
+      }
+
+      console.log(
+        `[SIGMA ACCESS] Licença gerada: ${data.license_key} | ${data.display_name} | ${data.plan}`
+      );
+
+      res.status(201).json({
+        ok: true,
+        message: "Chave gerada com sucesso.",
+        license: data
+      });
+    } catch (error) {
+      console.error(
+        "[SIGMA ACCESS] Erro ao gerar licença:",
+        error
+      );
+
+      res.status(500).json({
+        ok: false,
+        error: "LICENSE_CREATE_ERROR",
+        message:
+          error?.message ||
+          "Não foi possível gerar a licença."
+      });
+    }
+  }
+);
+
+app.get("/last", (_req, res) => {
+  res.json({
+    ok: true,
+    round: memory.last()
+  });
+});
 
 app.get("/memory", (req, res) => {
-  const requested = Number(req.query.limit || config.memoryLimit);
-  const limit = Math.max(1, Math.min(Number.isFinite(requested) ? requested : config.memoryLimit, config.memoryLimit));
+  const requested = Number(
+    req.query.limit || config.memoryLimit
+  );
+
+  const limit = Math.max(
+    1,
+    Math.min(
+      Number.isFinite(requested)
+        ? requested
+        : config.memoryLimit,
+      config.memoryLimit
+    )
+  );
+
   const rounds = memory.all().slice(0, limit);
-  res.json({ ok: true, count: rounds.length, memoryLimit: config.memoryLimit, rounds });
+
+  res.json({
+    ok: true,
+    count: rounds.length,
+    memoryLimit: config.memoryLimit,
+    rounds
+  });
 });
 
 app.get("/stats", (req, res) => {
   const requested = Number(req.query.sample || 50);
-  const sample = Math.max(1, Math.min(Number.isFinite(requested) ? requested : 50, 500));
-  res.json({ ok: true, sample, stats: memory.stats(sample) });
+
+  const sample = Math.max(
+    1,
+    Math.min(
+      Number.isFinite(requested) ? requested : 50,
+      500
+    )
+  );
+
+  res.json({
+    ok: true,
+    sample,
+    stats: memory.stats(sample)
+  });
 });
 
 app.get("/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader(
+    "Cache-Control",
+    "no-cache, no-transform"
+  );
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
+
   res.flushHeaders?.();
+
   const client = { res };
   clients.add(client);
-  res.write(`event: state\ndata: ${JSON.stringify({ ...live.state(), rounds: memory.size() })}\n\n`);
-  const heartbeat = setInterval(() => res.write(`event: heartbeat\ndata: ${Date.now()}\n\n`), 20000);
+
+  res.write(
+    `event: state\ndata: ${JSON.stringify({
+      ...live.state(),
+      rounds: memory.size()
+    })}\n\n`
+  );
+
+  const heartbeat = setInterval(() => {
+    res.write(
+      `event: heartbeat\ndata: ${Date.now()}\n\n`
+    );
+  }, 20000);
+
   req.on("close", () => {
     clearInterval(heartbeat);
     clients.delete(client);
@@ -90,35 +422,85 @@ app.get("/events", (req, res) => {
 });
 
 function broadcast(event, payload) {
-  const message = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+  const message =
+    `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+
   for (const client of clients) {
-    try { client.res.write(message); }
-    catch (_) { clients.delete(client); }
+    try {
+      client.res.write(message);
+    } catch (_error) {
+      clients.delete(client);
+    }
   }
 }
 
 live.on("round", round => {
   const inserted = memory.add(round);
+
   if (!inserted) {
-    console.log(`[LIVE] Rodada duplicada ignorada: ${round.id}`);
+    console.log(
+      `[LIVE] Rodada duplicada ignorada: ${round.id}`
+    );
     return;
   }
-  console.log(`[LIVE] Rodada armazenada: id=${round.id} roll=${round.roll} color=${round.color} memória=${memory.size()}`);
-  broadcast("round", { round, count: memory.size() });
+
+  console.log(
+    `[LIVE] Rodada armazenada: id=${round.id} roll=${round.roll} color=${round.color} memória=${memory.size()}`
+  );
+
+  broadcast("round", {
+    round,
+    count: memory.size()
+  });
 });
 
-live.on("state", state => broadcast("state", { ...state, rounds: memory.size() }));
-
-const server = app.listen(config.port, "0.0.0.0", () => {
-  console.log(`[SIGMA] Servidor HTTP ativo na porta ${config.port}.`);
-  live.start();
+live.on("state", state => {
+  broadcast("state", {
+    ...state,
+    rounds: memory.size()
+  });
 });
+
+const server = app.listen(
+  config.port,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `[SIGMA] Servidor HTTP ativo na porta ${config.port}.`
+    );
+
+    if (supabase) {
+      console.log(
+        "[SIGMA ACCESS] Cliente Supabase configurado."
+      );
+    } else {
+      console.warn(
+        "[SIGMA ACCESS] SUPABASE_URL ou SUPABASE_SECRET_KEY ausente."
+      );
+    }
+
+    if (!sigmaAdminToken) {
+      console.warn(
+        "[SIGMA ACCESS] SIGMA_ADMIN_TOKEN ainda não configurado."
+      );
+    }
+
+    live.start();
+  }
+);
 
 function shutdown(signal) {
   console.log(`[SIGMA] Encerrando por ${signal}.`);
+
   live.stop();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000).unref();
+
+  server.close(() => {
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 5000).unref();
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
