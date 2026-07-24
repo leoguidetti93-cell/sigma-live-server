@@ -1,8 +1,8 @@
 {
   "name": "sigma-live-server",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
-  "description": "SIGMA LIVE SERVER com inscrição double_room_1 e heartbeat Engine.IO v3.",
+  "description": "SIGMA LIVE SERVER com inscrição double_room_1, heartbeat Engine.IO v3 e SIGMA ACCESS.",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -13,6 +13,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "ws": "^8.18.0"
