@@ -11,7 +11,7 @@ services:
       - key: NODE_VERSION
         value: "20"
       - key: MEMORY_LIMIT
-        value: "500"
+        value: "1000"
       - key: BLAZE_ORIGIN
         value: "https://blaze.bet.br"
       - key: ALLOWED_ORIGINS

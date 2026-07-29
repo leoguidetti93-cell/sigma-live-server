@@ -11,7 +11,7 @@ Servidor Node.js que coleta os eventos ao vivo do Blaze Double e fornece uma API
 - ignora `waiting`;
 - armazena somente `complete`;
 - remove duplicidades;
-- mantém até 500 rodadas;
+- mantém até 1000 rodadas;
 - reconecta automaticamente.
 
 ## Endpoints

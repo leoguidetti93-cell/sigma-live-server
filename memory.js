@@ -1,7 +1,7 @@
 "use strict";
 
 class RoundMemory {
-  constructor(limit = 500) {
+  constructor(limit = 1000) {
     this.limit = limit;
     this.rounds = [];
     this.keys = new Set();
