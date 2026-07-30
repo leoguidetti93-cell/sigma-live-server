@@ -24,6 +24,27 @@ class RoundMemory {
     return true;
   }
 
+  hydrate(rounds) {
+    const ordered = Array.isArray(rounds)
+      ? rounds.filter(Boolean).slice().sort((a, b) =>
+          new Date(b.created_at || b.createdAt || 0) - new Date(a.created_at || a.createdAt || 0)
+        )
+      : [];
+
+    this.rounds = [];
+    this.keys = new Set();
+
+    for (const round of ordered) {
+      const key = this.createKey(round);
+      if (this.keys.has(key)) continue;
+      this.rounds.push(round);
+      this.keys.add(key);
+      if (this.rounds.length >= this.limit) break;
+    }
+
+    return this.size();
+  }
+
   all() { return [...this.rounds]; }
   last() { return this.rounds[0] || null; }
   size() { return this.rounds.length; }
