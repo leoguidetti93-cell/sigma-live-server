@@ -352,9 +352,12 @@ app.post(
         if (license.status !== "EXPIRED") await supabase.from(ACCESS_TABLE).update({ status: "EXPIRED" }).eq("id", license.id);
         return licenseFailure(res, 403, "LICENSE_EXPIRED", "Esta licença está expirada.");
       }
-      if (license.current_device && license.current_device !== deviceId) {
-        return licenseFailure(res, 409, "DEVICE_MISMATCH", "Esta licença já está vinculada a outro dispositivo.");
-      }
+      // Uma licença pode ficar ativa em somente uma sessão por vez.
+      // Uma nova ativação sempre assume a licença e substitui a sessão anterior,
+      // inclusive quando vem de outro navegador ou dispositivo.
+      const previousSession = license.current_session;
+      const previousDevice = license.current_device;
+      const isTransfer = Boolean(previousSession && (previousSession !== req.body?.session_id || previousDevice !== deviceId));
 
       const now = new Date().toISOString();
       const sessionId = crypto.randomUUID();
@@ -375,8 +378,18 @@ app.post(
         .single();
       if (updateError) throw updateError;
 
-      console.log(`[SIGMA ACCESS] Ativação: ${licenseKey} | ${deviceName} | ${deviceId}`);
-      res.json({ ok: true, message: "Licença ativada.", session_id: sessionId, license: publicLicensePayload(updated) });
+      if (isTransfer) {
+        console.log(`[SIGMA ACCESS] Sessão transferida: ${licenseKey} | ${previousDevice || "sem dispositivo"} -> ${deviceName} | ${deviceId}`);
+      } else {
+        console.log(`[SIGMA ACCESS] Ativação: ${licenseKey} | ${deviceName} | ${deviceId}`);
+      }
+      res.json({
+        ok: true,
+        message: isTransfer ? "Licença transferida para este dispositivo." : "Licença ativada.",
+        transferred: isTransfer,
+        session_id: sessionId,
+        license: publicLicensePayload(updated)
+      });
     } catch (error) {
       console.error("[SIGMA ACCESS] Erro na ativação:", error);
       res.status(500).json({ ok: false, error: "ACTIVATION_ERROR", message: error?.message || "Não foi possível ativar a licença." });
@@ -407,7 +420,15 @@ app.post(
         return licenseFailure(res, 403, "LICENSE_EXPIRED", "Esta licença está expirada.");
       }
       if (license.current_device !== deviceId || license.current_session !== sessionId) {
-        return licenseFailure(res, 401, "SESSION_INVALID", "Sessão inválida. Ative a licença novamente.");
+        const wasTransferred = Boolean(license.current_session && license.current_session !== sessionId);
+        return licenseFailure(
+          res,
+          401,
+          wasTransferred ? "SESSION_REVOKED" : "SESSION_INVALID",
+          wasTransferred
+            ? "Sua licença foi ativada em outro navegador ou dispositivo."
+            : "Sessão inválida. Ative a licença novamente."
+        );
       }
 
       const now = new Date().toISOString();
