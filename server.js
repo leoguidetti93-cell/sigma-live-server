@@ -9,7 +9,7 @@ const { createClient } = require("@supabase/supabase-js");
 const config = require("./config");
 const RoundMemory = require("./memory");
 const BlazeLiveSocket = require("./socket");
-const RoundStore = require("./round-store");
+const SigmaColorEngine = require("./color-engine");
 
 const APP_VERSION = "1.5.0";
 const ACCESS_TABLE = "sigma_access";
@@ -19,6 +19,7 @@ const LICENSE_LENGTH = 6;
 const app = express();
 const memory = new RoundMemory(config.memoryLimit);
 const clients = new Set();
+let colorEngine = null;
 
 const supabaseUrl = String(process.env.SUPABASE_URL || "").trim();
 const supabaseSecretKey = String(
@@ -28,6 +29,10 @@ const supabaseSecretKey = String(
 const sigmaAdminToken = String(
   process.env.SIGMA_ADMIN_TOKEN || ""
 ).trim();
+
+const telegramBotToken = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
+const telegramChatId = String(process.env.TELEGRAM_CHAT_ID || "").trim();
+const sigmaColor24hEnabled = String(process.env.SIGMA_COLOR_24H_ENABLED || "true").toLowerCase() !== "false";
 
 const supabase =
   supabaseUrl && supabaseSecretKey
@@ -39,14 +44,6 @@ const supabase =
         }
       })
     : null;
-
-const roundStore = new RoundStore({
-  supabase,
-  table: process.env.SIGMA_ROUNDS_TABLE || "sigma_double_rounds",
-  limit: config.memoryLimit
-});
-let roundPersistenceReady = false;
-let persistedSincePrune = 0;
 
 const live = new BlazeLiveSocket({
   url: config.blazeSocketUrl,
@@ -256,6 +253,7 @@ app.get("/", (_req, res) => {
       "/memory",
       "/stats",
       "/events",
+      "/api/sigma-reading/state",
       "/access/health",
       "/admin",
       "/api/access/activate",
@@ -280,11 +278,6 @@ app.get("/health", (_req, res) => {
     socketIoConnected: state.socketIoConnected,
     rounds: memory.size(),
     memoryLimit: config.memoryLimit,
-    authoritative: true,
-    source: roundPersistenceReady ? "SUPABASE" : "SERVER_RAM",
-    generatedAt: new Date().toISOString(),
-    roundsSource: roundPersistenceReady ? "SUPABASE" : "SERVER_RAM",
-    roundPersistenceReady,
     lastRound: memory.last(),
     lastConnectedAt: state.lastConnectedAt,
     lastDisconnectedAt: state.lastDisconnectedAt,
@@ -718,9 +711,6 @@ app.get("/memory", (req, res) => {
     ok: true,
     count: rounds.length,
     memoryLimit: config.memoryLimit,
-    authoritative: true,
-    source: roundPersistenceReady ? "SUPABASE" : "SERVER_RAM",
-    generatedAt: new Date().toISOString(),
     rounds
   });
 });
@@ -743,6 +733,11 @@ app.get("/stats", (req, res) => {
   });
 });
 
+
+app.get("/api/sigma-reading/state", (_req, res) => {
+  res.json({ ok: true, ...(colorEngine ? colorEngine.state() : { enabled: false, mode: "STARTING" }) });
+});
+
 app.get("/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader(
@@ -760,18 +755,7 @@ app.get("/events", (req, res) => {
   res.write(
     `event: state\ndata: ${JSON.stringify({
       ...live.state(),
-      rounds: memory.size(),
-      memoryLimit: config.memoryLimit,
-      roundPersistenceReady
-    })}\n\n`
-  );
-
-  res.write(
-    `event: snapshot\ndata: ${JSON.stringify({
-      authoritative: true,
-      count: memory.size(),
-      memoryLimit: config.memoryLimit,
-      rounds: memory.all()
+      rounds: memory.size()
     })}\n\n`
   );
 
@@ -800,11 +784,13 @@ function broadcast(event, payload) {
   }
 }
 
-live.on("round", async round => {
+live.on("round", round => {
   const inserted = memory.add(round);
 
   if (!inserted) {
-    console.log(`[LIVE] Rodada duplicada ignorada: ${round.id}`);
+    console.log(
+      `[LIVE] Rodada duplicada ignorada: ${round.id}`
+    );
     return;
   }
 
@@ -814,23 +800,12 @@ live.on("round", async round => {
 
   broadcast("round", {
     round,
-    count: memory.size(),
-    memoryLimit: config.memoryLimit
+    count: memory.size()
   });
 
-  if (roundPersistenceReady) {
-    try {
-      await roundStore.save(round);
-      persistedSincePrune += 1;
-      if (persistedSincePrune >= 100) {
-        persistedSincePrune = 0;
-        await roundStore.prune();
-      }
-    } catch (error) {
-      console.error("[SIGMA ROUNDS] Falha ao persistir rodada:", error?.message || error);
-    }
-  }
+  colorEngine?.enqueueRound(round);
 });
+
 live.on("state", state => {
   broadcast("state", {
     ...state,
@@ -862,29 +837,15 @@ const server = app.listen(
       );
     }
 
-    (async () => {
-      if (roundStore.enabled) {
-        try {
-          const persistedRounds = await roundStore.loadLatest();
-          memory.hydrate(persistedRounds);
-          roundPersistenceReady = true;
-          console.log(`[SIGMA ROUNDS] ${memory.size()} rodadas restauradas do Supabase.`);
-          broadcast("snapshot", {
-            authoritative: true,
-            count: memory.size(),
-            memoryLimit: config.memoryLimit,
-            rounds: memory.all()
-          });
-        } catch (error) {
-          roundPersistenceReady = false;
-          console.error("[SIGMA ROUNDS] Persistência indisponível; usando RAM:", error?.message || error);
-        }
-      } else {
-        console.warn("[SIGMA ROUNDS] Supabase ausente; histórico ficará somente em RAM.");
-      }
-
-      live.start();
-    })();
+    colorEngine = new SigmaColorEngine({
+      memory,
+      broadcast,
+      telegramToken: telegramBotToken,
+      telegramChatId,
+      enabled: sigmaColor24hEnabled
+    });
+    colorEngine.start();
+    live.start();
   }
 );
 
@@ -892,6 +853,7 @@ function shutdown(signal) {
   console.log(`[SIGMA] Encerrando por ${signal}.`);
 
   live.stop();
+  colorEngine?.stop();
 
   server.close(() => {
     process.exit(0);

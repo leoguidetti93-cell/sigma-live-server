@@ -39,3 +39,13 @@ Observação: o plano gratuito do Render pode suspender o serviço após um per�
 - reconhece o pong (`3`);
 - evita que a Blaze encerre a conexão por ausência de heartbeat;
 - expõe `subscribed`, `room`, `pingIntervalMs` e `pingTimeoutMs` em `/health`.
+
+## SIGMA COLOR 24H
+Configure no Render:
+- `MEMORY_LIMIT=3000`
+- `SIGMA_COLOR_24H_ENABLED=true`
+- `TELEGRAM_BOT_TOKEN=<token do bot>`
+- `TELEGRAM_CHAT_ID=<id do grupo>`
+
+O motor COLOR passa a processar as rodadas, Direta/G1, resultados e resumos diretamente no servidor, mesmo sem navegadores abertos.
+Estado: `GET /api/sigma-reading/state`.
