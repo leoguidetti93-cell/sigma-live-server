@@ -43,6 +43,19 @@ class SigmaWhiteEngine {
   chronologicalRounds() {
     return this.memory.all().slice().reverse().map(r => ({ ...r, color: normalizeColor(r), createdAt: roundTime(r) }));
   }
+  diagnostics() {
+    const rounds = this.chronologicalRounds();
+    const { gaps, since } = this.whiteGaps(rounds);
+    const whites = rounds.filter(r => r.color === "white").length;
+    return {
+      rounds: rounds.length,
+      whites,
+      intervals: gaps.length,
+      sinceLastWhite: since,
+      ready: gaps.length >= 1,
+      quality: gaps.length >= 5 ? "FULL" : gaps.length >= 2 ? "WARMING" : gaps.length >= 1 ? "INITIAL" : "WAITING_WHITE"
+    };
+  }
   state() {
     const wins = this.history.filter(x => x.status === "WIN").length;
     return {
@@ -52,6 +65,7 @@ class SigmaWhiteEngine {
       history: this.history.slice(0, 20),
       accuracy: this.history.length ? Math.round((wins / this.history.length) * 100) : null,
       telegramConfigured: Boolean(this.telegramToken && this.telegramChatId),
+      diagnostics: this.diagnostics(),
       updatedAt: new Date().toISOString()
     };
   }
@@ -80,19 +94,34 @@ class SigmaWhiteEngine {
   projectNextWhite() {
     const rounds = this.chronologicalRounds();
     const { gaps, since } = this.whiteGaps(rounds);
-    if (gaps.length < 5) return null;
+
+    // O servidor pode reiniciar sem histórico persistido. Em vez de ficar parado
+    // até acumular seis brancos, o motor entra em aquecimento assim que possui
+    // ao menos um intervalo real. A referência teórica de 15 rodadas perde peso
+    // automaticamente conforme novos intervalos reais são coletados.
+    if (gaps.length < 1) return null;
+
     const recent = gaps.slice(-40);
-    const weighted = recent.reduce((sum, g, i) => sum + g * (i + 1), 0) / recent.reduce((sum, _, i) => sum + i + 1, 0);
-    const med = median(recent);
-    const expected = Math.round(weighted * 0.65 + med * 0.35);
+    const weightTotal = recent.reduce((sum, _, i) => sum + i + 1, 0);
+    const weightedObserved = recent.reduce((sum, g, i) => sum + g * (i + 1), 0) / Math.max(1, weightTotal);
+    const medObserved = median(recent);
+    const observedExpected = weightedObserved * 0.65 + medObserved * 0.35;
+    const confidence = clamp(gaps.length / 8, 0.18, 1);
+    const theoreticalGap = 15;
+    const expected = Math.round(observedExpected * confidence + theoreticalGap * (1 - confidence));
+
     const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
     const variance = recent.reduce((a, b) => a + (b - mean) ** 2, 0) / recent.length;
     const spread = Math.sqrt(variance);
     const minuteModel = this.minuteWhiteModel(rounds);
     const recentWhites = rounds.slice(-120).filter(r => r.color === "white").length;
     const recentDensity = recentWhites / Math.max(1, Math.min(120, rounds.length));
-    const now = new Date(); now.setSeconds(0, 0);
+    const warmup = gaps.length < 5;
+
+    const now = new Date();
+    now.setSeconds(0, 0);
     let best = null;
+
     for (let minuteOffset = 1; minuteOffset <= 240; minuteOffset += 1) {
       const target = new Date(now.getTime() + minuteOffset * 60000);
       const projectedGap = since + minuteOffset * 2;
@@ -100,11 +129,26 @@ class SigmaWhiteEngine {
       const localMinute = Number(new Intl.DateTimeFormat("en-US", { timeZone: "America/Sao_Paulo", minute: "2-digit" }).format(target));
       const minuteStat = minuteModel[localMinute];
       const minuteRate = minuteStat.total ? minuteStat.white / minuteStat.total : 0;
-      const minuteScore = clamp(Math.round(55 + minuteRate * 220), 50, 92);
+      // Com amostra curta, minuto sem histórico deve ser neutro, não punitivo.
+      const minuteScore = minuteStat.total >= 3
+        ? clamp(Math.round(55 + minuteRate * 220), 50, 92)
+        : 66;
       const densityScore = clamp(Math.round(70 + (recentDensity - 0.07) * 180), 55, 88);
-      const stabilityScore = clamp(Math.round(88 - spread * 2 - Math.abs(weighted - med)), 50, 90);
+      const stabilityScore = recent.length >= 3
+        ? clamp(Math.round(88 - spread * 2 - Math.abs(weightedObserved - medObserved)), 50, 90)
+        : 68;
       const distancePenalty = Math.min(12, Math.floor(minuteOffset / 35));
-      const score = clamp(Math.round(gapScore * 0.42 + minuteScore * 0.28 + stabilityScore * 0.20 + densityScore * 0.10 - distancePenalty), 50, 94);
+      let score = clamp(Math.round(
+        gapScore * 0.48 +
+        minuteScore * 0.22 +
+        stabilityScore * 0.20 +
+        densityScore * 0.10 -
+        distancePenalty
+      ), 50, 94);
+
+      // Evita confiança artificialmente alta durante o aquecimento.
+      if (warmup) score = Math.min(score, gaps.length >= 3 ? 82 : 78);
+
       const targetMs = target.getTime();
       const candidate = {
         id: `server-white-${targetMs}`,
@@ -118,16 +162,23 @@ class SigmaWhiteEngine {
         windowStartAt: new Date(targetMs - 60000).toISOString(),
         windowEndAt: new Date(targetMs + 120000).toISOString(),
         processedHouses: 0,
+        sampleQuality: warmup ? "WARMING" : "FULL",
+        intervalsUsed: gaps.length,
         reasons: [
           `Intervalo projetado ${projectedGap} rodadas; referência ${expected}.`,
           minuteStat.total ? `Minuto ${String(localMinute).padStart(2, "0")} teve ${Math.round(minuteRate * 100)}% de brancos na amostra.` : "Minuto ainda com pouca recorrência histórica.",
           `Dispersão recente dos intervalos: ${spread.toFixed(1)}.`,
-          `${recentWhites} brancos nas últimas ${Math.min(120, rounds.length)} rodadas.`
+          `${recentWhites} brancos nas últimas ${Math.min(120, rounds.length)} rodadas.`,
+          warmup ? `Motor em aquecimento com ${gaps.length} intervalo(s) real(is).` : `Base completa com ${gaps.length} intervalos.`
         ]
       };
-      if (!best || candidate.score > best.score || (candidate.score === best.score && targetMs < new Date(best.targetAt).getTime())) best = candidate;
+
+      if (!best || candidate.score > best.score || (candidate.score === best.score && targetMs < new Date(best.targetAt).getTime())) {
+        best = candidate;
+      }
     }
-    return best && best.score >= 60 ? best : null;
+
+    return best && best.score >= 58 ? best : null;
   }
   async ensureProjection() {
     if (this.active || !this.enabled) return;

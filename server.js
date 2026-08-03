@@ -13,7 +13,7 @@ const BlazeLiveSocket = require("./socket");
 const SigmaColorEngine = require("./color-engine");
 const SigmaWhiteEngine = require("./white-engine");
 
-const APP_VERSION = "1.5.2";
+const APP_VERSION = "1.5.3";
 const ACCESS_TABLE = "sigma_access";
 const LICENSE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LICENSE_LENGTH = 6;
