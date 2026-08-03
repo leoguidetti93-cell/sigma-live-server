@@ -33,13 +33,36 @@ class SigmaWhiteEngine {
     this.history = [];
     this.processing = Promise.resolve();
     this.lastProcessedRoundKey = "";
+    this.cooldownMs = 2 * 60 * 1000;
+    this.cooldownUntil = null;
+    this.watchdog = null;
+    this.cooldownTimer = null;
+    this.summaryTimer = null;
+    this.settling = false;
+    this.operationArchive = [];
+    this.lastHourlySummaryKey = null;
+    this.lastDailySummaryKey = null;
   }
 
   start() {
     console.log(`[SIGMA WHITE] Motor 24h ${this.enabled ? "ATIVO" : "DESATIVADO"}. Telegram=${Boolean(this.telegramToken && this.telegramChatId)}`);
-    if (this.enabled) this.ensureProjection();
+    if (this.enabled) {
+      this.ensureProjection();
+      this.watchdog = setInterval(() => this.checkOperationTimeout(), 5000);
+      this.watchdog.unref?.();
+      this.summaryTimer = setInterval(() => this.checkScheduledSummaries().catch(error => console.error("[SIGMA WHITE] resumo", error)), 15000);
+      this.summaryTimer.unref?.();
+      this.checkScheduledSummaries().catch(error => console.error("[SIGMA WHITE] resumo", error));
+    }
   }
-  stop() {}
+  stop() {
+    if (this.watchdog) clearInterval(this.watchdog);
+    if (this.cooldownTimer) clearTimeout(this.cooldownTimer);
+    if (this.summaryTimer) clearInterval(this.summaryTimer);
+    this.watchdog = null;
+    this.cooldownTimer = null;
+    this.summaryTimer = null;
+  }
   chronologicalRounds() {
     return this.memory.all().slice().reverse().map(r => ({ ...r, color: normalizeColor(r), createdAt: roundTime(r) }));
   }
@@ -65,6 +88,7 @@ class SigmaWhiteEngine {
       history: this.history.slice(0, 20),
       accuracy: this.history.length ? Math.round((wins / this.history.length) * 100) : null,
       telegramConfigured: Boolean(this.telegramToken && this.telegramChatId),
+      cooldownUntil: this.cooldownUntil,
       diagnostics: this.diagnostics(),
       updatedAt: new Date().toISOString()
     };
@@ -181,7 +205,12 @@ class SigmaWhiteEngine {
     return best && best.score >= 58 ? best : null;
   }
   async ensureProjection() {
-    if (this.active || !this.enabled) return;
+    if (this.active || !this.enabled || this.settling) return;
+    if (this.cooldownUntil && Date.now() < new Date(this.cooldownUntil).getTime()) {
+      this.emitState();
+      return;
+    }
+    this.cooldownUntil = null;
     const candidate = this.projectNextWhite();
     if (!candidate) return;
     this.active = candidate;
@@ -205,7 +234,12 @@ class SigmaWhiteEngine {
       }
       return;
     }
-    if (time >= end) return;
+    if (time >= end) {
+      // A janela terminou. Mesmo que alguma rodada tenha sido perdida pelo stream,
+      // a operação precisa ser encerrada para nunca ficar travada em 4/6 ou 5/6.
+      await this.settle("LOSS", "LOSS", null, round);
+      return;
+    }
     this.active.status = "IN_OPERATION";
     this.active.processedHouses = Math.min(6, (this.active.processedHouses || 0) + 1);
     if (normalizeColor(round) === "white") {
@@ -219,13 +253,123 @@ class SigmaWhiteEngine {
     this.emitState();
   }
   async settle(status, result, house, round) {
+    if (!this.active || this.settling) return;
+    this.settling = true;
     const finished = { ...this.active, status, result, house, resolvedAt: roundTime(round) };
     this.history.unshift(finished);
     this.history = this.history.slice(0, 20);
-    if (finished.score >= 72) await this.sendResult(finished);
+    if (finished.score >= 72) {
+      this.operationArchive.unshift(finished);
+      this.operationArchive = this.operationArchive.slice(0, 2500);
+      await this.sendResult(finished);
+    }
     this.active = null;
+    this.cooldownUntil = new Date(Date.now() + this.cooldownMs).toISOString();
+    this.settling = false;
     this.emitState();
-    await this.ensureProjection();
+
+    if (this.cooldownTimer) clearTimeout(this.cooldownTimer);
+    this.cooldownTimer = setTimeout(() => {
+      this.cooldownTimer = null;
+      this.ensureProjection().catch(error => console.error("[SIGMA WHITE] cooldown", error));
+    }, this.cooldownMs + 250);
+    this.cooldownTimer.unref?.();
+  }
+
+
+  saoPauloParts(date = new Date()) {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "America/Sao_Paulo", year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"
+    }).formatToParts(date);
+    return Object.fromEntries(parts.map(p => [p.type, p.value]));
+  }
+  localKey(date = new Date()) {
+    const p = this.saoPauloParts(date);
+    return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}`;
+  }
+  localDateKey(date = new Date()) {
+    const p = this.saoPauloParts(date);
+    return `${p.year}-${p.month}-${p.day}`;
+  }
+  localHourKey(date = new Date()) {
+    const p = this.saoPauloParts(date);
+    return `${p.year}-${p.month}-${p.day}-${p.hour}`;
+  }
+  localBoundaryToUtc({ year, month, day, hour = 0, minute = 0, second = 0 }) {
+    // America/Sao_Paulo is UTC-3 in the current deployment context.
+    return new Date(Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour) + 3, Number(minute), Number(second)));
+  }
+  periodStats(start, end) {
+    const operations = this.operationArchive.filter(op => {
+      const t = new Date(op.resolvedAt || op.createdAt).getTime();
+      return Number.isFinite(t) && t >= start.getTime() && t < end.getTime();
+    });
+    const wins = operations.filter(op => op.status === "WIN");
+    const losses = operations.filter(op => op.status === "LOSS");
+    const whites = this.chronologicalRounds().filter(round => {
+      const t = new Date(round.createdAt).getTime();
+      return round.color === "white" && Number.isFinite(t) && t >= start.getTime() && t < end.getTime();
+    }).length;
+    const houses = Array.from({ length: 6 }, (_, i) => wins.filter(op => Number(op.house) === i + 1).length);
+    const accuracy = operations.length ? (wins.length / operations.length) * 100 : 0;
+    return { signals: operations.length, wins: wins.length, losses: losses.length, whites, houses, accuracy };
+  }
+  async sendHourlySummary(now = new Date()) {
+    const p = this.saoPauloParts(now);
+    const end = this.localBoundaryToUtc({ year: p.year, month: p.month, day: p.day, hour: p.hour, minute: 0 });
+    const start = new Date(end.getTime() - 60 * 60 * 1000);
+    const stats = this.periodStats(start, end);
+    const startLabel = fmtTime(start);
+    const endLabel = fmtTime(new Date(end.getTime() - 1000));
+    const houseLine = stats.wins ? `\n🏠 Casas: C1 ${stats.houses[0]} • C2 ${stats.houses[1]} • C3 ${stats.houses[2]} • C4 ${stats.houses[3]} • C5 ${stats.houses[4]} • C6 ${stats.houses[5]}` : "";
+    await this.sendTelegram(`📊 SIGMA WHITE • RESUMO DA HORA\n\n🕒 Período: ${startLabel} às ${endLabel}\n📡 Sinais finalizados: ${stats.signals}\n✅ Wins: ${stats.wins}\n❌ Loss: ${stats.losses}\n⚪ Brancos no período: ${stats.whites}${houseLine}\n🎯 Assertividade: ${stats.accuracy.toFixed(1).replace(".", ",")}%`);
+  }
+  async sendDailySummary(now = new Date()) {
+    const p = this.saoPauloParts(now);
+    const start = this.localBoundaryToUtc({ year: p.year, month: p.month, day: p.day, hour: 0, minute: 0 });
+    const end = new Date(now.getTime() + 1000);
+    const stats = this.periodStats(start, end);
+    const houseLine = stats.wins ? `\n🏠 Casas: C1 ${stats.houses[0]} • C2 ${stats.houses[1]} • C3 ${stats.houses[2]} • C4 ${stats.houses[3]} • C5 ${stats.houses[4]} • C6 ${stats.houses[5]}` : "";
+    await this.sendTelegram(`📈 SIGMA WHITE • FECHAMENTO DO DIA\n\n📅 Data: ${p.day}/${p.month}/${p.year}\n📡 Sinais finalizados: ${stats.signals}\n✅ Wins: ${stats.wins}\n❌ Loss: ${stats.losses}\n⚪ Brancos no dia: ${stats.whites}${houseLine}\n🎯 Assertividade: ${stats.accuracy.toFixed(1).replace(".", ",")}%`);
+  }
+  async checkScheduledSummaries() {
+    if (!this.enabled || !this.telegramToken || !this.telegramChatId) return;
+    const now = new Date();
+    const p = this.saoPauloParts(now);
+    const minute = Number(p.minute);
+    const second = Number(p.second);
+
+    if (minute === 0 && second < 45) {
+      const key = this.localHourKey(now);
+      if (this.lastHourlySummaryKey !== key) {
+        this.lastHourlySummaryKey = key;
+        await this.sendHourlySummary(now);
+      }
+    }
+
+    if (Number(p.hour) === 23 && minute === 59 && second < 45) {
+      const key = this.localDateKey(now);
+      if (this.lastDailySummaryKey !== key) {
+        this.lastDailySummaryKey = key;
+        await this.sendDailySummary(now);
+      }
+    }
+  }
+
+  async checkOperationTimeout() {
+    if (!this.enabled || !this.active || this.settling) return;
+    const end = new Date(this.active.windowEndAt).getTime();
+    if (!Number.isFinite(end)) return;
+    // Dá 30 segundos de tolerância para atrasos normais do stream.
+    if (Date.now() < end + 30000) return;
+    const syntheticRound = {
+      id: `white-timeout-${Date.now()}`,
+      created_at: new Date().toISOString(),
+      roll: null,
+      color: null
+    };
+    await this.settle("LOSS", "LOSS", null, syntheticRound);
   }
   async sendTelegram(text) {
     if (!this.telegramToken || !this.telegramChatId) return null;
