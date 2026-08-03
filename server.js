@@ -12,7 +12,7 @@ const BlazeLiveSocket = require("./socket");
 const SigmaColorEngine = require("./color-engine");
 const SigmaWhiteEngine = require("./white-engine");
 
-const APP_VERSION = "1.5.0";
+const APP_VERSION = "1.5.1";
 const ACCESS_TABLE = "sigma_access";
 const LICENSE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LICENSE_LENGTH = 6;
@@ -35,8 +35,30 @@ const sigmaAdminToken = String(
 const telegramBotToken = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const telegramChatId = String(process.env.TELEGRAM_CHAT_ID || "").trim();
 const sigmaColor24hEnabled = String(process.env.SIGMA_COLOR_24H_ENABLED || "true").toLowerCase() !== "false";
-const telegramWhiteChatId = String(process.env.TELEGRAM_WHITE_CHAT_ID || "").trim();
-const sigmaWhite24hEnabled = String(process.env.SIGMA_WHITE_24H_ENABLED || "false").toLowerCase() === "true";
+const telegramWhiteChatId = String(
+  process.env.TELEGRAM_WHITE_CHAT_ID ||
+  process.env.TELEGRAM_WHITE_GROUP_ID ||
+  ""
+).trim();
+
+function envFlag(value, fallback = false) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!normalized) return fallback;
+  if (["false", "0", "off", "no", "disabled"].includes(normalized)) return false;
+  if (["true", "1", "on", "yes", "enabled"].includes(normalized)) return true;
+  return fallback;
+}
+
+// Se o Chat ID WHITE estiver configurado, o motor fica ativo por padrão.
+// A variável SIGMA_WHITE_24H_ENABLED ainda pode desligá-lo explicitamente.
+const whiteEnabledRaw =
+  process.env.SIGMA_WHITE_24H_ENABLED ??
+  process.env.SIGMA_WHITE_ENABLED ??
+  "";
+const sigmaWhite24hEnabled = envFlag(
+  whiteEnabledRaw,
+  Boolean(telegramWhiteChatId)
+);
 
 const supabase =
   supabaseUrl && supabaseSecretKey
@@ -289,7 +311,17 @@ app.get("/health", (_req, res) => {
     lastError: state.lastError,
     reconnectAttempt: state.reconnectAttempt,
     sigmaAccessConfigured: Boolean(supabase),
-    sigmaAdminConfigured: Boolean(sigmaAdminToken)
+    sigmaAdminConfigured: Boolean(sigmaAdminToken),
+    colorEngine: {
+      enabled: sigmaColor24hEnabled,
+      telegramConfigured: Boolean(telegramBotToken && telegramChatId)
+    },
+    whiteEngine: {
+      enabled: sigmaWhite24hEnabled,
+      telegramConfigured: Boolean(telegramBotToken && telegramWhiteChatId),
+      chatIdConfigured: Boolean(telegramWhiteChatId),
+      envValueReceived: String(whiteEnabledRaw || "(vazio)")
+    }
   });
 });
 
@@ -845,6 +877,10 @@ const server = app.listen(
         "[SIGMA ACCESS] SIGMA_ADMIN_TOKEN ainda não configurado."
       );
     }
+
+    console.log(
+      `[SIGMA WHITE] Configuração: enabled=${sigmaWhite24hEnabled} chatId=${telegramWhiteChatId ? "OK" : "AUSENTE"} token=${telegramBotToken ? "OK" : "AUSENTE"} env=${String(whiteEnabledRaw || "(vazio)")}`
+    );
 
     colorEngine = new SigmaColorEngine({
       memory,

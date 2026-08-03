@@ -1,6 +1,6 @@
 {
   "name": "sigma-live-server",
-  "version": "1.3.0",
+  "version": "1.5.1",
   "private": true,
   "description": "SIGMA LIVE SERVER com painel administrativo SIGMA ACCESS, Supabase e transmissão ao vivo.",
   "main": "server.js",
