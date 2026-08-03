@@ -8,6 +8,7 @@ class MemoryStore {
     this.filepath = filepath || process.env.ROUND_MEMORY_FILE || "/var/data/sigma-rounds.json";
     this.timer = null;
     this.lastError = null;
+    this.fallbackUsed = false;
   }
 
   ensureDirectory() {
@@ -45,6 +46,8 @@ class MemoryStore {
       // Render sem disco persistente: usa diretório local do projeto como fallback.
       if (this.filepath.startsWith("/var/data/")) {
         this.filepath = path.join(__dirname, "data", "sigma-rounds.json");
+        this.fallbackUsed = true;
+        console.warn(`[MEMORY] /var/data indisponível; usando armazenamento efêmero em ${this.filepath}.`);
         return this.save(rounds);
       }
       console.warn(`[MEMORY] Não foi possível salvar: ${this.lastError}`);

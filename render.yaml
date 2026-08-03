@@ -18,6 +18,8 @@ services:
         value: "true"
       - key: SIGMA_WHITE_24H_ENABLED
         value: "true"
+      - key: BLAZE_HISTORY_BACKFILL_ENABLED
+        value: "false"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID

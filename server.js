@@ -14,7 +14,7 @@ const SigmaColorEngine = require("./color-engine");
 const SigmaWhiteEngine = require("./white-engine");
 const HistoryLoader = require("./history-loader");
 
-const APP_VERSION = "1.5.4";
+const APP_VERSION = "1.5.6";
 const ACCESS_TABLE = "sigma_access";
 const LICENSE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LICENSE_LENGTH = 6;
@@ -114,7 +114,7 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "100kb" }));
+app.use(express.json({ limit: "8mb" }));
 
 const adminPublicDir = path.join(__dirname, "public");
 app.use("/admin", express.static(adminPublicDir, { index: false, maxAge: "1h" }));
@@ -352,7 +352,9 @@ app.get("/health", (_req, res) => {
     memoryPersistence: {
       file: memoryStore.filepath,
       restored: restoredCount,
-      lastError: memoryStore.lastError
+      lastError: memoryStore.lastError,
+      fallbackUsed: Boolean(memoryStore.fallbackUsed),
+      persistentDiskActive: memoryStore.filepath.startsWith("/var/data/")
     },
     historyBackfill: historyLoader.state(),
     whiteDiagnostics: (() => {
@@ -832,11 +834,11 @@ app.post("/memory/bootstrap", async (req, res) => {
     }
     const before = memory.size();
     const inserted = memory.addMany(imported);
-    memoryStore.save(memory.all());
+    const saved = memoryStore.save(memory.all());
     console.log(`[MEMORY] Bootstrap recebido do ORION: ${inserted} novas | total=${memory.size()}.`);
     broadcast("memory-bootstrap", { inserted, count: memory.size() });
     await whiteEngine?.ensureProjection?.();
-    return res.json({ ok: true, inserted, before, count: memory.size(), memoryLimit: config.memoryLimit });
+    return res.json({ ok: true, inserted, before, count: memory.size(), memoryLimit: config.memoryLimit, persisted: saved, persistenceFile: memoryStore.filepath });
   } catch (error) {
     console.error("[MEMORY] Erro no bootstrap:", error);
     return res.status(500).json({ ok: false, error: "BOOTSTRAP_ERROR", message: error?.message || "Falha ao importar memória." });
@@ -970,9 +972,11 @@ const server = app.listen(
     whiteEngine.start();
     live.start();
 
-    // Recupera o histórico diretamente da fonte, sem depender do navegador.
-    // O mesmo objeto `memory` alimenta Catalogador, COLOR e WHITE.
-    if (memory.size() < Math.min(config.memoryLimit, 300)) {
+    // O histórico oficial é a memória central restaurada do disco e/ou
+    // sincronizada pelo ORION. O endpoint HTTP público da Blaze retorna 451
+    // no Render; por isso o backfill remoto só roda quando for habilitado
+    // explicitamente por BLAZE_HISTORY_BACKFILL_ENABLED=true.
+    if (String(process.env.BLAZE_HISTORY_BACKFILL_ENABLED || "false").toLowerCase() === "true" && memory.size() < Math.min(config.memoryLimit, 300)) {
       historyLoader.load().then(() => {
         broadcast("memory-backfill", { count: memory.size(), state: historyLoader.state() });
       });
