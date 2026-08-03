@@ -118,6 +118,121 @@ class SigmaColorEngine {
     return d;
   }
 
+  roundNumber(round) {
+    const value = Number(round?.roll ?? round?.number ?? round?.value);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  sequenceSimilarity(a, b) {
+    if (!a.length || a.length !== b.length) return 0;
+    let earned = 0, possible = 0;
+    for (let i = 0; i < a.length; i++) {
+      // As posições mais recentes têm um pouco mais de peso.
+      const recencyWeight = 1 + (i / Math.max(1, a.length - 1)) * 0.45;
+      const colorWeight = 0.72 * recencyWeight;
+      const numberWeight = 0.28 * recencyWeight;
+      possible += colorWeight + numberWeight;
+
+      if (a[i].color === b[i].color) earned += colorWeight;
+
+      const na = this.roundNumber(a[i]);
+      const nb = this.roundNumber(b[i]);
+      if (na !== null && nb !== null) {
+        const distance = Math.abs(na - nb);
+        earned += numberWeight * Math.max(0, 1 - distance / 14);
+      }
+    }
+    return possible ? earned / possible : 0;
+  }
+
+  similarityWindow(rounds, size) {
+    if (rounds.length < size + 3) return null;
+    const current = rounds.slice(-size);
+    const candidates = [];
+
+    // Exclui a própria janela atual e exige duas rodadas posteriores para avaliar Direta/G1.
+    for (let end = size - 1; end <= rounds.length - 3; end++) {
+      const historical = rounds.slice(end - size + 1, end + 1);
+      const similarity = this.sequenceSimilarity(current, historical);
+      if (similarity < 0.58) continue;
+      candidates.push({ end, similarity });
+    }
+
+    candidates.sort((x, y) => y.similarity - x.similarity);
+    const selected = candidates.slice(0, 80);
+    if (!selected.length) return null;
+
+    const targets = {
+      red: { direct: 0, g1: 0, white: 0, loss: 0, weight: 0 },
+      black: { direct: 0, g1: 0, white: 0, loss: 0, weight: 0 }
+    };
+
+    for (const match of selected) {
+      const first = rounds[match.end + 1]?.color;
+      const second = rounds[match.end + 2]?.color;
+      const w = match.similarity * match.similarity;
+      for (const target of ["red", "black"]) {
+        const bucket = targets[target];
+        bucket.weight += w;
+        if (first === target) bucket.direct += w;
+        else if (first === "white") bucket.white += w;
+        else if (second === target) bucket.g1 += w;
+        else if (second === "white") bucket.white += w;
+        else bucket.loss += w;
+      }
+    }
+
+    for (const target of ["red", "black"]) {
+      const bucket = targets[target];
+      bucket.success = bucket.weight
+        ? Math.round(((bucket.direct + bucket.g1 + bucket.white) / bucket.weight) * 100)
+        : 0;
+    }
+
+    return {
+      size,
+      matches: selected.length,
+      averageSimilarity: Math.round((selected.reduce((sum, item) => sum + item.similarity, 0) / selected.length) * 100),
+      targets
+    };
+  }
+
+  similaritySensor(rounds, target) {
+    const configs = [
+      { size: 8, weight: 0.45 },
+      { size: 15, weight: 0.35 },
+      { size: 25, weight: 0.20 }
+    ];
+    const windows = configs
+      .map(config => ({ ...config, result: this.similarityWindow(rounds, config.size) }))
+      .filter(item => item.result);
+
+    if (!windows.length) return { score: 50, confidence: 0, matches: 0, windows: [] };
+
+    let weightedScore = 0, effectiveWeight = 0, totalMatches = 0;
+    for (const item of windows) {
+      const support = Math.min(1, item.result.matches / 20);
+      const reliability = item.weight * (0.45 + support * 0.55);
+      weightedScore += item.result.targets[target].success * reliability;
+      effectiveWeight += reliability;
+      totalMatches += item.result.matches;
+    }
+
+    const score = effectiveWeight ? Math.round(weightedScore / effectiveWeight) : 50;
+    const confidence = Math.min(100, Math.round((totalMatches / (windows.length * 30)) * 100));
+    return {
+      score,
+      confidence,
+      matches: totalMatches,
+      windows: windows.map(item => ({
+        size: item.size,
+        matches: item.result.matches,
+        similarity: item.result.averageSimilarity,
+        success: item.result.targets[target].success
+      }))
+    };
+  }
+
   testPattern(rounds, pattern, target) {
     let direct = 0, g1 = 0, white = 0, loss = 0, cases = 0;
     const len = pattern.length;
@@ -164,12 +279,16 @@ class SigmaColorEngine {
     const pattern = this.choosePattern(rounds);
     const target = pattern?.target || reversal || dominant;
     if (!target) return null;
-    let score = 45;
-    if (pattern) score = Math.round(pattern.success * 0.65 + Math.min(100, pattern.cases * 3) * 0.20 + Math.min(100, Math.abs(redP - blackP) * 4) * 0.15);
-    if (streak.count >= 3) score = Math.min(96, score + 5);
+    let baseScore = 45;
+    if (pattern) baseScore = Math.round(pattern.success * 0.65 + Math.min(100, pattern.cases * 3) * 0.20 + Math.min(100, Math.abs(redP - blackP) * 4) * 0.15);
+    if (streak.count >= 3) baseScore = Math.min(96, baseScore + 5);
+
+    // O novo sensor representa 20% do score. Não há corte novo de sinais nesta versão.
+    const similarity = this.similaritySensor(rounds, target);
+    const score = Math.max(0, Math.min(99, Math.round(baseScore * 0.80 + similarity.score * 0.20)));
     const grade = score >= 78 ? "FORTE" : score >= 62 ? "ATENÇÃO" : score < 45 ? "EVITAR" : "NEUTRO";
     return {
-      target, score, grade,
+      target, score, baseScore, grade, similarity,
       pattern: pattern ? pattern.pattern.map(c => c === "red" ? "V" : "P").join(" • ") : "LEITURA DINÂMICA",
       anchorKey: roundKey(latest), anchorAt: latest.createdAt
     };
