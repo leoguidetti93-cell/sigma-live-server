@@ -10,6 +10,7 @@ const config = require("./config");
 const RoundMemory = require("./memory");
 const BlazeLiveSocket = require("./socket");
 const SigmaColorEngine = require("./color-engine");
+const SigmaWhiteEngine = require("./white-engine");
 
 const APP_VERSION = "1.5.0";
 const ACCESS_TABLE = "sigma_access";
@@ -20,6 +21,7 @@ const app = express();
 const memory = new RoundMemory(config.memoryLimit);
 const clients = new Set();
 let colorEngine = null;
+let whiteEngine = null;
 
 const supabaseUrl = String(process.env.SUPABASE_URL || "").trim();
 const supabaseSecretKey = String(
@@ -33,6 +35,8 @@ const sigmaAdminToken = String(
 const telegramBotToken = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const telegramChatId = String(process.env.TELEGRAM_CHAT_ID || "").trim();
 const sigmaColor24hEnabled = String(process.env.SIGMA_COLOR_24H_ENABLED || "true").toLowerCase() !== "false";
+const telegramWhiteChatId = String(process.env.TELEGRAM_WHITE_CHAT_ID || "").trim();
+const sigmaWhite24hEnabled = String(process.env.SIGMA_WHITE_24H_ENABLED || "false").toLowerCase() === "true";
 
 const supabase =
   supabaseUrl && supabaseSecretKey
@@ -738,6 +742,10 @@ app.get("/api/sigma-reading/state", (_req, res) => {
   res.json({ ok: true, ...(colorEngine ? colorEngine.state() : { enabled: false, mode: "STARTING" }) });
 });
 
+app.get("/api/sigma-white/state", (_req, res) => {
+  res.json({ ok: true, ...(whiteEngine ? whiteEngine.state() : { enabled: false, mode: "STARTING" }) });
+});
+
 app.get("/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader(
@@ -804,6 +812,7 @@ live.on("round", round => {
   });
 
   colorEngine?.enqueueRound(round);
+  whiteEngine?.enqueueRound(round);
 });
 
 live.on("state", state => {
@@ -845,6 +854,15 @@ const server = app.listen(
       enabled: sigmaColor24hEnabled
     });
     colorEngine.start();
+
+    whiteEngine = new SigmaWhiteEngine({
+      memory,
+      broadcast,
+      telegramToken: telegramBotToken,
+      telegramChatId: telegramWhiteChatId,
+      enabled: sigmaWhite24hEnabled
+    });
+    whiteEngine.start();
     live.start();
   }
 );
@@ -854,6 +872,7 @@ function shutdown(signal) {
 
   live.stop();
   colorEngine?.stop();
+  whiteEngine?.stop();
 
   server.close(() => {
     process.exit(0);
