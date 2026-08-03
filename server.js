@@ -12,8 +12,9 @@ const MemoryStore = require("./memory-store");
 const BlazeLiveSocket = require("./socket");
 const SigmaColorEngine = require("./color-engine");
 const SigmaWhiteEngine = require("./white-engine");
+const HistoryLoader = require("./history-loader");
 
-const APP_VERSION = "1.5.3";
+const APP_VERSION = "1.5.4";
 const ACCESS_TABLE = "sigma_access";
 const LICENSE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LICENSE_LENGTH = 6;
@@ -24,6 +25,7 @@ const memory = new RoundMemory(config.memoryLimit, rounds => memoryStore.schedul
 const restoredRounds = memoryStore.load();
 const restoredCount = memory.load(restoredRounds);
 if (restoredCount) console.log(`[MEMORY] ${restoredCount} rodadas restauradas de ${memoryStore.filepath}.`);
+const historyLoader = new HistoryLoader({ memory, store: memoryStore, limit: config.memoryLimit });
 const clients = new Set();
 let colorEngine = null;
 let whiteEngine = null;
@@ -352,6 +354,7 @@ app.get("/health", (_req, res) => {
       restored: restoredCount,
       lastError: memoryStore.lastError
     },
+    historyBackfill: historyLoader.state(),
     whiteDiagnostics: (() => {
       const rounds = memory.all();
       const whites = rounds.filter(round => Number(round.roll) === 0 || Number(round.color) === 0).length;
@@ -761,6 +764,11 @@ app.get("/last", (_req, res) => {
   });
 });
 
+app.post("/memory/backfill", async (_req, res) => {
+  const state = await historyLoader.load();
+  res.json({ ok: !state.lastError, count: memory.size(), memoryLimit: config.memoryLimit, ...state });
+});
+
 app.get("/memory", (req, res) => {
   const requested = Number(
     req.query.limit || config.memoryLimit
@@ -961,6 +969,14 @@ const server = app.listen(
     });
     whiteEngine.start();
     live.start();
+
+    // Recupera o histórico diretamente da fonte, sem depender do navegador.
+    // O mesmo objeto `memory` alimenta Catalogador, COLOR e WHITE.
+    if (memory.size() < Math.min(config.memoryLimit, 300)) {
+      historyLoader.load().then(() => {
+        broadcast("memory-backfill", { count: memory.size(), state: historyLoader.state() });
+      });
+    }
   }
 );
 
