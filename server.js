@@ -8,17 +8,22 @@ const { createClient } = require("@supabase/supabase-js");
 
 const config = require("./config");
 const RoundMemory = require("./memory");
+const MemoryStore = require("./memory-store");
 const BlazeLiveSocket = require("./socket");
 const SigmaColorEngine = require("./color-engine");
 const SigmaWhiteEngine = require("./white-engine");
 
-const APP_VERSION = "1.5.1";
+const APP_VERSION = "1.5.2";
 const ACCESS_TABLE = "sigma_access";
 const LICENSE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LICENSE_LENGTH = 6;
 
 const app = express();
-const memory = new RoundMemory(config.memoryLimit);
+const memoryStore = new MemoryStore(process.env.ROUND_MEMORY_FILE);
+const memory = new RoundMemory(config.memoryLimit, rounds => memoryStore.schedule(rounds));
+const restoredRounds = memoryStore.load();
+const restoredCount = memory.load(restoredRounds);
+if (restoredCount) console.log(`[MEMORY] ${restoredCount} rodadas restauradas de ${memoryStore.filepath}.`);
 const clients = new Set();
 let colorEngine = null;
 let whiteEngine = null;
@@ -264,6 +269,25 @@ async function createUniqueLicenseKey(maxAttempts = 10) {
   );
 }
 
+function normalizeBootstrapRounds(items) {
+  return (Array.isArray(items) ? items : [])
+    .map(item => memory.normalize(item))
+    .filter(Boolean)
+    .slice(-config.memoryLimit);
+}
+
+function bootstrapMatchesLive(imported) {
+  if (!memory.size()) return true;
+  const current = memory.all().slice(0, 30);
+  const importedKeys = new Set(imported.slice(-120).map(round => memory.createKey(round)));
+  if (current.some(round => importedKeys.has(memory.createKey(round)))) return true;
+  const newestImported = imported.at(-1);
+  const newestCurrent = memory.last();
+  if (!newestImported || !newestCurrent) return false;
+  const delta = Math.abs(new Date(newestImported.created_at) - new Date(newestCurrent.created_at));
+  return Number.isFinite(delta) && delta <= 15 * 60 * 1000;
+}
+
 app.get("/", (_req, res) => {
   res.json({
     name: "SIGMA LIVE SERVER",
@@ -320,8 +344,19 @@ app.get("/health", (_req, res) => {
       enabled: sigmaWhite24hEnabled,
       telegramConfigured: Boolean(telegramBotToken && telegramWhiteChatId),
       chatIdConfigured: Boolean(telegramWhiteChatId),
-      envValueReceived: String(whiteEnabledRaw || "(vazio)")
-    }
+      envValueReceived: String(whiteEnabledRaw || "(vazio)"),
+      state: whiteEngine?.state?.() || null
+    },
+    memoryPersistence: {
+      file: memoryStore.filepath,
+      restored: restoredCount,
+      lastError: memoryStore.lastError
+    },
+    whiteDiagnostics: (() => {
+      const rounds = memory.all();
+      const whites = rounds.filter(round => Number(round.roll) === 0 || Number(round.color) === 0).length;
+      return { rounds: rounds.length, whites, intervals: Math.max(0, whites - 1), ready: whites >= 6 };
+    })()
   });
 });
 
@@ -778,6 +813,32 @@ app.get("/api/sigma-white/state", (_req, res) => {
   res.json({ ok: true, ...(whiteEngine ? whiteEngine.state() : { enabled: false, mode: "STARTING" }) });
 });
 
+app.post("/memory/bootstrap", async (req, res) => {
+  try {
+    const imported = normalizeBootstrapRounds(req.body?.rounds);
+    if (imported.length < 20) {
+      return res.status(400).json({ ok: false, error: "INSUFFICIENT_ROUNDS", message: "Envie ao menos 20 rodadas válidas." });
+    }
+    if (!bootstrapMatchesLive(imported)) {
+      return res.status(409).json({ ok: false, error: "MEMORY_MISMATCH", message: "A memória enviada não corresponde às rodadas atuais do servidor." });
+    }
+    const before = memory.size();
+    const inserted = memory.addMany(imported);
+    memoryStore.save(memory.all());
+    console.log(`[MEMORY] Bootstrap recebido do ORION: ${inserted} novas | total=${memory.size()}.`);
+    broadcast("memory-bootstrap", { inserted, count: memory.size() });
+    await whiteEngine?.ensureProjection?.();
+    return res.json({ ok: true, inserted, before, count: memory.size(), memoryLimit: config.memoryLimit });
+  } catch (error) {
+    console.error("[MEMORY] Erro no bootstrap:", error);
+    return res.status(500).json({ ok: false, error: "BOOTSTRAP_ERROR", message: error?.message || "Falha ao importar memória." });
+  }
+});
+
+app.get("/api/white/state", (_req, res) => {
+  res.json(whiteEngine?.state?.() || { enabled: sigmaWhite24hEnabled, active: null, history: [], accuracy: null });
+});
+
 app.get("/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader(
@@ -906,6 +967,7 @@ const server = app.listen(
 function shutdown(signal) {
   console.log(`[SIGMA] Encerrando por ${signal}.`);
 
+  memoryStore.save(memory.all());
   live.stop();
   colorEngine?.stop();
   whiteEngine?.stop();
