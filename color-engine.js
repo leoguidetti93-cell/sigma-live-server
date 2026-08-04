@@ -339,7 +339,7 @@ class SigmaColorEngine {
     this.operation = {
       id: `server-color-${suggestion.anchorKey}-${suggestion.target}-${crypto.randomBytes(3).toString("hex")}`,
       ...suggestion,
-      g2Enabled: suggestion.score >= 84,
+      g2Enabled: suggestion.score >= 80,
       phase: "DIRECT",
       createdAt: new Date().toISOString(),
       source: "SIGMA_SERVER_24H"

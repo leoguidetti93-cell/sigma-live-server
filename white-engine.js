@@ -42,6 +42,8 @@ class SigmaWhiteEngine {
     this.summaryTimer = null;
     this.settling = false;
     this.operationArchive = [];
+    this.observationArchive = [];
+    this.observationTracking = [];
     this.lastHourlySummaryKey = null;
     this.lastDailySummaryKey = null;
     this.whiteDebug = {
@@ -84,13 +86,14 @@ class SigmaWhiteEngine {
         delete this.learning.sensors.stability;
       }
       if (Array.isArray(saved?.operationArchive)) this.operationArchive = saved.operationArchive.slice(0, 2500);
+      if (Array.isArray(saved?.observationArchive)) this.observationArchive = saved.observationArchive.slice(0, 5000);
       console.log(`[SIGMA WHITE V2] Aprendizado restaurado: ${this.learning.operations || 0} operações.`);
     } catch (error) {
       console.warn(`[SIGMA WHITE V2] Falha ao restaurar aprendizado: ${error?.message || error}`);
     }
   }
   saveLearning() {
-    const payload = JSON.stringify({ savedAt: new Date().toISOString(), learning: this.learning, operationArchive: this.operationArchive.slice(0, 2500) });
+    const payload = JSON.stringify({ savedAt: new Date().toISOString(), learning: this.learning, operationArchive: this.operationArchive.slice(0, 2500), observationArchive: this.observationArchive.slice(0, 5000) });
     const trySave = file => {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       const tmp = `${file}.tmp`;
@@ -234,6 +237,8 @@ class SigmaWhiteEngine {
       diagnostics: this.diagnostics(),
       learning: { operations: this.learning.operations || 0, weights: this.sensorWeights(), sensors: this.learning.sensors },
       whiteDebug: this.whiteDebug,
+      observationTracking: this.observationTracking.slice(0, 10),
+      observationArchiveCount: this.observationArchive.length,
       updatedAt: new Date().toISOString()
     };
   }
@@ -259,6 +264,25 @@ class SigmaWhiteEngine {
     });
     return model;
   }
+  normalizeSensor(value, min, max) {
+    return clamp((Number(value) - min) / Math.max(0.0001, max - min), 0, 1);
+  }
+  calibrateScore(rawStrength) {
+    const points = [[0,30],[20,42],[40,55],[50,64],[60,72],[70,80],[80,88],[90,94],[100,98]];
+    const x = clamp(Number(rawStrength) || 0, 0, 100);
+    for (let i = 1; i < points.length; i += 1) {
+      const [x1, y1] = points[i - 1];
+      const [x2, y2] = points[i];
+      if (x <= x2) return Math.round(y1 + ((x - x1) / (x2 - x1)) * (y2 - y1));
+    }
+    return 98;
+  }
+  signalTier(score) {
+    if (score >= 93) return "ELITE";
+    if (score >= 85) return "FORTE";
+    return "NORMAL";
+  }
+
   projectNextWhite() {
     const rounds = this.chronologicalRounds();
     const { gaps, since } = this.whiteGaps(rounds);
@@ -321,30 +345,33 @@ class SigmaWhiteEngine {
         minute: { probability: minuteProbability },
         similarity: { probability: similarityProbability, matches: similarity.matches, confidence: similarity.confidence }
       };
-      const consensusVotes = [
-        gapProbability,
-        pressureProbability,
-        densityProbability,
-        dispersionProbability,
-        minuteProbability,
-        similarityProbability
-      ].filter(p => p >= 0.48).length;
-      const weightedProbability =
-        gapProbability * weights.gap +
-        pressureProbability * weights.pressure +
-        densityProbability * weights.density +
-        dispersionProbability * weights.dispersion +
-        minuteProbability * weights.minute +
-        similarityProbability * weights.similarity;
-      const probability = clamp(weightedProbability, 0.05, 0.92);
-      const score = clamp(Math.round(probability * 100), 40, 92);
+      Object.entries(normalized).forEach(([key, strength]) => { components[key].strength = Number((strength * 100).toFixed(1)); });
+      const normalized = {
+        gap: this.normalizeSensor(gapProbability, 0.06, 0.84),
+        pressure: this.normalizeSensor(pressureProbability, 0.10, 0.78),
+        density: this.normalizeSensor(densityProbability, 0.10, 0.68),
+        dispersion: this.normalizeSensor(dispersionProbability, 0.12, 0.72),
+        minute: this.normalizeSensor(minuteProbability, 0.08, 0.78),
+        similarity: this.normalizeSensor(similarityProbability, 0.05, 0.92)
+      };
+      const consensusVotes = Object.values(normalized).filter(v => v >= 0.55).length;
+      const rawStrength = (
+        normalized.gap * weights.gap +
+        normalized.pressure * weights.pressure +
+        normalized.density * weights.density +
+        normalized.dispersion * weights.dispersion +
+        normalized.minute * weights.minute +
+        normalized.similarity * weights.similarity
+      ) * 100;
+      const score = this.calibrateScore(rawStrength);
+      const probability = clamp(score / 100, 0.30, 0.98);
 
       const targetMs = target.getTime();
       const candidate = {
         id: `server-white-v2-${targetMs}`,
-        engineVersion: "WHITE_V2_2_CANDIDATO_CONTINUO_DEBUG",
-        targetAt: target.toISOString(), createdAt: new Date().toISOString(), score,
-        probability: Number(probability.toFixed(4)), expectedGap: Math.round(expected), sinceAtProjection: since,
+        engineVersion: "WHITE_V2_3_SCORE_NORMALIZADO_TELEMETRIA",
+        targetAt: target.toISOString(), createdAt: new Date().toISOString(), score, rawScore: Number(rawStrength.toFixed(1)),
+        signalTier: this.signalTier(score), probability: Number(probability.toFixed(4)), expectedGap: Math.round(expected), sinceAtProjection: since,
         status: "WAITING", classification: score >= 72 && (consensusVotes >= 4 || (score >= 79 && consensusVotes >= 3)) ? "ACTIVE" : "OBSERVATION",
         windowStartAt: new Date(targetMs - 60000).toISOString(),
         windowEndAt: new Date(targetMs + 120000).toISOString(), processedHouses: 0,
@@ -356,6 +383,7 @@ class SigmaWhiteEngine {
           `Intervalo projetado ${projectedGap}; referência ${Math.round(expected)}.`,
           `Pressão estatística: percentil ${(pressurePercentile * 100).toFixed(0)}%.`,
           `Minuto ${String(localMinute).padStart(2, "0")}: taxa ajustada ${(minuteProbability * 100).toFixed(0)}%.`,
+          `Score-base normalizado: ${rawStrength.toFixed(1)}; calibrado: ${score}.`,
           `Aprendizado contínuo: ${this.learning.operations || 0} operações avaliadas.`
         ]
       };
@@ -395,6 +423,7 @@ class SigmaWhiteEngine {
     this.lastProcessedRoundKey = key;
     if (!this.active) { await this.ensureProjection(); return; }
     const time = new Date(roundTime(round)).getTime();
+    await this.processObservationRound(round, time);
     const start = new Date(this.active.windowStartAt).getTime();
     const end = new Date(this.active.windowEndAt).getTime();
     if (time < start) {
@@ -414,7 +443,7 @@ class SigmaWhiteEngine {
       return;
     }
     if (time >= start && this.active.classification !== "ACTIVE") {
-      // Candidatos em observação nunca viram operação real nem bloqueiam o motor.
+      this.beginObservationTracking(this.active);
       this.active = null;
       this.emitState();
       await this.ensureProjection();
@@ -438,6 +467,39 @@ class SigmaWhiteEngine {
     }
     this.emitState();
   }
+  beginObservationTracking(candidate) {
+    if (!candidate || this.observationTracking.some(x => x.id === candidate.id)) return;
+    this.observationTracking.unshift({
+      ...candidate, status: "OBSERVING_RESULT", processedHouses: 0,
+      observationStartedAt: new Date().toISOString()
+    });
+    this.observationTracking = this.observationTracking.slice(0, 12);
+  }
+  async processObservationRound(round, timeMs) {
+    if (!this.observationTracking.length) return;
+    const color = normalizeColor(round);
+    const finished = [];
+    for (const obs of this.observationTracking) {
+      const start = new Date(obs.windowStartAt).getTime();
+      const end = new Date(obs.windowEndAt).getTime();
+      if (!Number.isFinite(start) || !Number.isFinite(end) || timeMs < start) continue;
+      if (timeMs >= end) { finished.push({ ...obs, status: "LOSS", result: "LOSS", resolvedAt: roundTime(round) }); continue; }
+      obs.processedHouses = Math.min(6, (obs.processedHouses || 0) + 1);
+      if (color === "white") {
+        finished.push({ ...obs, status: "WIN", result: `WIN CASA ${obs.processedHouses}`, house: obs.processedHouses, resolvedAt: roundTime(round) });
+      } else if (obs.processedHouses >= 6) {
+        finished.push({ ...obs, status: "LOSS", result: "LOSS", resolvedAt: roundTime(round) });
+      }
+    }
+    if (finished.length) {
+      const ids = new Set(finished.map(x => x.id));
+      this.observationTracking = this.observationTracking.filter(x => !ids.has(x.id));
+      finished.forEach(item => this.observationArchive.unshift(item));
+      this.observationArchive = this.observationArchive.slice(0, 5000);
+      this.saveLearning();
+    }
+  }
+
   async settle(status, result, house, round) {
     if (!this.active || this.settling) return;
     this.settling = true;
@@ -500,7 +562,14 @@ class SigmaWhiteEngine {
     }).length;
     const houses = Array.from({ length: 6 }, (_, i) => wins.filter(op => Number(op.house) === i + 1).length);
     const accuracy = operations.length ? (wins.length / operations.length) * 100 : 0;
-    return { signals: operations.length, wins: wins.length, losses: losses.length, whites, houses, accuracy };
+    const observations = this.observationArchive.filter(op => {
+      const t = new Date(op.resolvedAt || op.createdAt).getTime();
+      return Number.isFinite(t) && t >= start.getTime() && t < end.getTime();
+    });
+    const observationWins = observations.filter(op => op.status === "WIN");
+    const observationLosses = observations.filter(op => op.status === "LOSS");
+    const observationAccuracy = observations.length ? observationWins.length / observations.length * 100 : 0;
+    return { signals: operations.length, wins: wins.length, losses: losses.length, whites, houses, accuracy, observations, observationWins, observationLosses, observationAccuracy };
   }
   async sendHourlySummary(now = new Date()) {
     const p = this.saoPauloParts(now);
@@ -512,13 +581,37 @@ class SigmaWhiteEngine {
     const houseLine = stats.wins ? `\n🏠 Casas: C1 ${stats.houses[0]} • C2 ${stats.houses[1]} • C3 ${stats.houses[2]} • C4 ${stats.houses[3]} • C5 ${stats.houses[4]} • C6 ${stats.houses[5]}` : "";
     await this.sendTelegram(`📊 SIGMA WHITE • RESUMO DA HORA\n\n🕒 Período: ${startLabel} às ${endLabel}\n📡 Sinais finalizados: ${stats.signals}\n✅ Wins: ${stats.wins}\n❌ Loss: ${stats.losses}\n⚪ Brancos no período: ${stats.whites}${houseLine}\n🎯 Assertividade: ${stats.accuracy.toFixed(1).replace(".", ",")}%`);
   }
+  scoreBucket(score) {
+    if (score >= 93) return "93+";
+    if (score >= 90) return "90-92";
+    if (score >= 85) return "85-89";
+    if (score >= 80) return "80-84";
+    if (score >= 72) return "72-79";
+    if (score >= 60) return "60-71";
+    if (score >= 50) return "50-59";
+    return "<50";
+  }
   async sendDailySummary(now = new Date()) {
     const p = this.saoPauloParts(now);
     const start = this.localBoundaryToUtc({ year: p.year, month: p.month, day: p.day, hour: 0, minute: 0 });
     const end = new Date(now.getTime() + 1000);
     const stats = this.periodStats(start, end);
     const houseLine = stats.wins ? `\n🏠 Casas: C1 ${stats.houses[0]} • C2 ${stats.houses[1]} • C3 ${stats.houses[2]} • C4 ${stats.houses[3]} • C5 ${stats.houses[4]} • C6 ${stats.houses[5]}` : "";
-    await this.sendTelegram(`📈 SIGMA WHITE • FECHAMENTO DO DIA\n\n📅 Data: ${p.day}/${p.month}/${p.year}\n📡 Sinais finalizados: ${stats.signals}\n✅ Wins: ${stats.wins}\n❌ Loss: ${stats.losses}\n⚪ Brancos no dia: ${stats.whites}${houseLine}\n🎯 Assertividade: ${stats.accuracy.toFixed(1).replace(".", ",")}%`);
+    const all = [...stats.observations, ...this.operationArchive.filter(op => { const t = new Date(op.resolvedAt || op.createdAt).getTime(); return Number.isFinite(t) && t >= start.getTime() && t < end.getTime(); })];
+    const buckets = { "93+":0, "90-92":0, "85-89":0, "80-84":0, "72-79":0, "60-71":0, "50-59":0, "<50":0 };
+    all.forEach(x => { buckets[this.scoreBucket(Number(x.score) || 0)] += 1; });
+    const published = all.filter(x => x.classification === "ACTIVE" || Number(x.score) >= 72);
+    const avg = items => items.length ? items.reduce((a,b) => a + (Number(b.score)||0),0) / items.length : 0;
+    const winOps = published.filter(x => x.status === "WIN");
+    const lossOps = published.filter(x => x.status === "LOSS");
+    const sensorNames = { gap:"Intervalo", pressure:"Pressão", density:"Densidade", dispersion:"Dispersão", minute:"Minuto", similarity:"Similaridade" };
+    const sensorStats = {};
+    Object.keys(sensorNames).forEach(key => {
+      const vals = all.map(x => Number(x.components?.[key]?.strength)).filter(Number.isFinite);
+      sensorStats[key] = vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : 0;
+    });
+    const text = `📈 SIGMA WHITE • FECHAMENTO DO DIA\n\n📅 Data: ${p.day}/${p.month}/${p.year}\n📡 Sinais finalizados: ${stats.signals}\n✅ Wins: ${stats.wins}\n❌ Loss: ${stats.losses}\n⚪ Brancos no dia: ${stats.whites}${houseLine}\n🎯 Assertividade: ${stats.accuracy.toFixed(1).replace(".", ",")}%\n\n🧠 DIAGNÓSTICO TÉCNICO\n👀 Observações avaliadas: ${stats.observations.length}\n⚪ Observações que pagariam: ${stats.observationWins.length}\n❌ Observações que falhariam: ${stats.observationLosses.length}\n📊 Acerto das observações: ${stats.observationAccuracy.toFixed(1).replace(".", ",")}%\n\n📚 Scores: 93+ ${buckets["93+"]} • 90-92 ${buckets["90-92"]} • 85-89 ${buckets["85-89"]} • 80-84 ${buckets["80-84"]} • 72-79 ${buckets["72-79"]} • 60-71 ${buckets["60-71"]} • 50-59 ${buckets["50-59"]} • <50 ${buckets["<50"]}\n\n📐 Score médio WIN: ${avg(winOps).toFixed(1).replace(".", ",")}\n📐 Score médio LOSS: ${avg(lossOps).toFixed(1).replace(".", ",")}\n📈 Maior score: ${all.length ? Math.max(...all.map(x=>Number(x.score)||0)) : 0}\n📉 Menor score publicado: ${published.length ? Math.min(...published.map(x=>Number(x.score)||0)) : 0}\n\n🧩 Força média dos sensores\n${Object.entries(sensorNames).map(([k,n]) => `${n}: ${sensorStats[k].toFixed(1).replace(".", ",")}%`).join("\n")}`;
+    await this.sendTelegram(text);
   }
   async checkScheduledSummaries() {
     if (!this.enabled || !this.telegramToken || !this.telegramChatId) return;
@@ -571,7 +664,11 @@ class SigmaWhiteEngine {
   async sendSignal(operation) {
     if (operation.telegramSignalSent) return;
     operation.telegramSignalSent = true;
-    await this.sendTelegram(`Σ SIGMA LEITURA • WHITE\n\n⚪ BRANCO PROJETADO\n\n⏰ Horário central: ${fmtTime(operation.targetAt)}\n🕒 Janela: ${fmtTime(operation.windowStartAt)} até ${fmtTime(new Date(new Date(operation.targetAt).getTime() + 60000))}\n🎯 Margem: 6 casas\n📊 Score: ${operation.score}`);
+    const tier = operation.signalTier || this.signalTier(operation.score);
+    const header = tier === "ELITE" ? "👑 SIGMA WHITE • SINAL ELITE" : tier === "FORTE" ? "🔥 SIGMA WHITE • SINAL FORTE" : "Σ SIGMA LEITURA • WHITE";
+    const badge = tier === "ELITE" ? "\n🚨 CENÁRIO RARÍSSIMO • 90+" : tier === "FORTE" ? "\n💪 CONFIANÇA ELEVADA" : "";
+    const strengths = Object.entries(operation.components || {}).sort((a,b)=>(b[1].strength||0)-(a[1].strength||0)).slice(0,3).map(([k,v]) => `✔ ${({gap:"Intervalo",pressure:"Pressão",density:"Densidade",dispersion:"Dispersão",minute:"Minuto",similarity:"Similaridade"})[k]} ${Number(v.strength||0).toFixed(0)}%`).join("\n");
+    await this.sendTelegram(`${header}\n\n⚪ BRANCO PROJETADO\n\n⏰ Horário central: ${fmtTime(operation.targetAt)}\n🕒 Janela: ${fmtTime(operation.windowStartAt)} até ${fmtTime(new Date(new Date(operation.targetAt).getTime() + 60000))}\n🎯 Margem: 6 casas\n📊 Score: ${operation.score} (base ${operation.rawScore ?? "—"})${badge}${strengths ? `\n\n${strengths}` : ""}`);
   }
   async sendResult(operation) {
     const text = operation.status === "WIN"
