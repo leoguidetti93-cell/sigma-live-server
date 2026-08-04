@@ -1,5 +1,7 @@
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 const median = values => {
   if (!values.length) return 0;
@@ -42,6 +44,126 @@ class SigmaWhiteEngine {
     this.operationArchive = [];
     this.lastHourlySummaryKey = null;
     this.lastDailySummaryKey = null;
+    this.learningFile = process.env.WHITE_LEARNING_FILE || "/var/data/sigma-white-learning.json";
+    this.learning = {
+      version: 2,
+      operations: 0,
+      sensors: {
+        gap: { mae: 0.30, n: 0 },
+        minute: { mae: 0.30, n: 0 },
+        stability: { mae: 0.30, n: 0 },
+        density: { mae: 0.30, n: 0 },
+        similarity: { mae: 0.26, n: 0 }
+      }
+    };
+    this.loadLearning();
+  }
+
+
+  loadLearning() {
+    try {
+      if (!fs.existsSync(this.learningFile)) return;
+      const saved = JSON.parse(fs.readFileSync(this.learningFile, "utf8"));
+      if (saved?.learning?.sensors) this.learning = saved.learning;
+      if (Array.isArray(saved?.operationArchive)) this.operationArchive = saved.operationArchive.slice(0, 2500);
+      console.log(`[SIGMA WHITE V2] Aprendizado restaurado: ${this.learning.operations || 0} operações.`);
+    } catch (error) {
+      console.warn(`[SIGMA WHITE V2] Falha ao restaurar aprendizado: ${error?.message || error}`);
+    }
+  }
+  saveLearning() {
+    const payload = JSON.stringify({ savedAt: new Date().toISOString(), learning: this.learning, operationArchive: this.operationArchive.slice(0, 2500) });
+    const trySave = file => {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.tmp`;
+      fs.writeFileSync(tmp, payload, "utf8");
+      fs.renameSync(tmp, file);
+    };
+    try {
+      trySave(this.learningFile);
+    } catch (error) {
+      if (this.learningFile.startsWith("/var/data/")) {
+        this.learningFile = path.join(__dirname, "data", "sigma-white-learning.json");
+        try { trySave(this.learningFile); } catch (_) {}
+      }
+    }
+  }
+  sensorWeights() {
+    const base = { gap: 0.22, minute: 0.10, stability: 0.08, density: 0.08, similarity: 0.52 };
+    const scored = Object.fromEntries(Object.entries(base).map(([key, value]) => {
+      const sensor = this.learning.sensors[key] || { mae: 0.30, n: 0 };
+      const experience = clamp((sensor.n || 0) / 80, 0, 1);
+      const reliability = 1 / (0.12 + clamp(sensor.mae || 0.30, 0.08, 0.65));
+      return [key, value * ((1 - experience) + experience * reliability / 2.6)];
+    }));
+    const total = Object.values(scored).reduce((a, b) => a + b, 0) || 1;
+    return Object.fromEntries(Object.entries(scored).map(([k, v]) => [k, v / total]));
+  }
+  patternSimilarity(rounds, aEnd, bEnd, length) {
+    let score = 0;
+    let weight = 0;
+    for (let j = 0; j < length; j += 1) {
+      const a = rounds[aEnd - j];
+      const b = rounds[bEnd - j];
+      if (!a || !b) return 0;
+      const w = 1 + (length - j) / length;
+      weight += w;
+      if (a.color === b.color) score += w * 0.72;
+      const ar = Number(a.roll ?? a.number ?? a.value);
+      const br = Number(b.roll ?? b.number ?? b.value);
+      if (Number.isFinite(ar) && Number.isFinite(br)) {
+        if (ar === br) score += w * 0.28;
+        else if (a.color === b.color && Math.abs(ar - br) <= 2) score += w * 0.12;
+      }
+    }
+    return weight ? clamp(score / weight, 0, 1) : 0;
+  }
+  similarityForecast(rounds, since, horizonRounds) {
+    const currentEnd = rounds.length - 1;
+    const windows = [8, 15, 25].filter(n => rounds.length > n + horizonRounds + 8);
+    if (!windows.length) return { probability: 0.18, matches: 0, confidence: 0, agreement: 0 };
+    const matches = [];
+    let lastWhite = -1;
+    const sinceAt = [];
+    rounds.forEach((r, i) => { if (r.color === "white") lastWhite = i; sinceAt[i] = lastWhite >= 0 ? i - lastWhite : i + 1; });
+    const maxAnchor = rounds.length - horizonRounds - 4;
+    for (let i = Math.max(30, windows.at(-1)); i < maxAnchor; i += 1) {
+      const sinceDiff = Math.abs((sinceAt[i] || 0) - since);
+      if (sinceDiff > 10) continue;
+      const sims = windows.map(n => this.patternSimilarity(rounds, currentEnd, i, n));
+      const sim = sims.reduce((a, b, idx) => a + b * ([0.42, 0.36, 0.22][idx] || 0.2), 0) / sims.reduce((a, _, idx) => a + ([0.42, 0.36, 0.22][idx] || 0.2), 0);
+      const sinceScore = clamp(1 - sinceDiff / 11, 0, 1);
+      const combined = sim * 0.82 + sinceScore * 0.18;
+      if (combined < 0.61) continue;
+      const start = i + Math.max(1, horizonRounds - 2);
+      const end = i + horizonRounds + 3;
+      const hit = rounds.slice(start, end + 1).some(r => r?.color === "white");
+      matches.push({ combined, hit });
+    }
+    matches.sort((a, b) => b.combined - a.combined);
+    const top = matches.slice(0, 80);
+    if (top.length < 5) return { probability: 0.18, matches: top.length, confidence: top.length / 5 * 0.35, agreement: 0 };
+    let hitWeight = 0, totalWeight = 0;
+    top.forEach(m => { const w = m.combined ** 3; totalWeight += w; if (m.hit) hitWeight += w; });
+    const raw = totalWeight ? hitWeight / totalWeight : 0;
+    const prior = 0.33;
+    const shrink = top.length / (top.length + 18);
+    const probability = raw * shrink + prior * (1 - shrink);
+    const agreement = Math.abs(raw - 0.5) * 2;
+    return { probability: clamp(probability, 0.05, 0.92), matches: top.length, confidence: clamp(top.length / 45, 0, 1), agreement };
+  }
+  updateLearning(operation) {
+    const y = operation.status === "WIN" ? 1 : 0;
+    const components = operation.components || {};
+    Object.entries(this.learning.sensors).forEach(([key, sensor]) => {
+      const p = clamp(Number(components[key]?.probability ?? components[key] ?? 0.5), 0.02, 0.98);
+      const error = Math.abs(y - p);
+      const alpha = sensor.n < 25 ? 0.12 : 0.045;
+      sensor.mae = sensor.n ? sensor.mae * (1 - alpha) + error * alpha : error;
+      sensor.n = (sensor.n || 0) + 1;
+    });
+    this.learning.operations = (this.learning.operations || 0) + 1;
+    this.saveLearning();
   }
 
   start() {
@@ -90,6 +212,7 @@ class SigmaWhiteEngine {
       telegramConfigured: Boolean(this.telegramToken && this.telegramChatId),
       cooldownUntil: this.cooldownUntil,
       diagnostics: this.diagnostics(),
+      learning: { operations: this.learning.operations || 0, weights: this.sensorWeights(), sensors: this.learning.sensors },
       updatedAt: new Date().toISOString()
     };
   }
@@ -118,90 +241,77 @@ class SigmaWhiteEngine {
   projectNextWhite() {
     const rounds = this.chronologicalRounds();
     const { gaps, since } = this.whiteGaps(rounds);
+    if (gaps.length < 5 || rounds.length < 300) return null;
 
-    // O servidor pode reiniciar sem histórico persistido. Em vez de ficar parado
-    // até acumular seis brancos, o motor entra em aquecimento assim que possui
-    // ao menos um intervalo real. A referência teórica de 15 rodadas perde peso
-    // automaticamente conforme novos intervalos reais são coletados.
-    if (gaps.length < 1) return null;
-
-    const recent = gaps.slice(-40);
+    const recent = gaps.slice(-60);
     const weightTotal = recent.reduce((sum, _, i) => sum + i + 1, 0);
     const weightedObserved = recent.reduce((sum, g, i) => sum + g * (i + 1), 0) / Math.max(1, weightTotal);
     const medObserved = median(recent);
-    const observedExpected = weightedObserved * 0.65 + medObserved * 0.35;
-    const confidence = clamp(gaps.length / 8, 0.18, 1);
-    const theoreticalGap = 15;
-    const expected = Math.round(observedExpected * confidence + theoreticalGap * (1 - confidence));
-
+    const expected = weightedObserved * 0.62 + medObserved * 0.38;
     const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
     const variance = recent.reduce((a, b) => a + (b - mean) ** 2, 0) / recent.length;
     const spread = Math.sqrt(variance);
     const minuteModel = this.minuteWhiteModel(rounds);
     const recentWhites = rounds.slice(-120).filter(r => r.color === "white").length;
     const recentDensity = recentWhites / Math.max(1, Math.min(120, rounds.length));
-    const warmup = gaps.length < 5;
+    const weights = this.sensorWeights();
 
     const now = new Date();
     now.setSeconds(0, 0);
     let best = null;
 
-    for (let minuteOffset = 1; minuteOffset <= 240; minuteOffset += 1) {
+    for (let minuteOffset = 2; minuteOffset <= 240; minuteOffset += 1) {
       const target = new Date(now.getTime() + minuteOffset * 60000);
-      const projectedGap = since + minuteOffset * 2;
-      const gapScore = clamp(92 - Math.abs(projectedGap - expected) * 3, 45, 92);
+      const horizonRounds = minuteOffset * 2;
+      const projectedGap = since + horizonRounds;
+      const gapProbability = clamp(0.12 + 0.72 * Math.exp(-Math.abs(projectedGap - expected) / Math.max(5, spread + 3)), 0.06, 0.84);
       const localMinute = Number(new Intl.DateTimeFormat("en-US", { timeZone: "America/Sao_Paulo", minute: "2-digit" }).format(target));
       const minuteStat = minuteModel[localMinute];
-      const minuteRate = minuteStat.total ? minuteStat.white / minuteStat.total : 0;
-      // Com amostra curta, minuto sem histórico deve ser neutro, não punitivo.
-      const minuteScore = minuteStat.total >= 3
-        ? clamp(Math.round(55 + minuteRate * 220), 50, 92)
-        : 66;
-      const densityScore = clamp(Math.round(70 + (recentDensity - 0.07) * 180), 55, 88);
-      const stabilityScore = recent.length >= 3
-        ? clamp(Math.round(88 - spread * 2 - Math.abs(weightedObserved - medObserved)), 50, 90)
-        : 68;
-      const distancePenalty = Math.min(12, Math.floor(minuteOffset / 35));
-      let score = clamp(Math.round(
-        gapScore * 0.48 +
-        minuteScore * 0.22 +
-        stabilityScore * 0.20 +
-        densityScore * 0.10 -
-        distancePenalty
-      ), 50, 94);
+      const minuteRate = minuteStat.total ? minuteStat.white / minuteStat.total : recentDensity;
+      const minuteProbability = clamp(0.12 + minuteRate * 3.2, 0.08, 0.78);
+      const stabilityProbability = clamp(0.68 - spread / 45, 0.12, 0.72);
+      const densityProbability = clamp(0.16 + recentDensity * 3.0, 0.10, 0.68);
+      const similarity = this.similarityForecast(rounds, since, horizonRounds);
+      const similarityProbability = similarity.probability;
 
-      // Evita confiança artificialmente alta durante o aquecimento.
-      if (warmup) score = Math.min(score, gaps.length >= 3 ? 82 : 78);
+      const components = {
+        gap: { probability: gapProbability },
+        minute: { probability: minuteProbability },
+        stability: { probability: stabilityProbability },
+        density: { probability: densityProbability },
+        similarity: { probability: similarityProbability, matches: similarity.matches, confidence: similarity.confidence }
+      };
+      const consensusVotes = [gapProbability, minuteProbability, stabilityProbability, densityProbability, similarityProbability].filter(p => p >= 0.48).length;
+      const weightedProbability =
+        gapProbability * weights.gap + minuteProbability * weights.minute +
+        stabilityProbability * weights.stability + densityProbability * weights.density +
+        similarityProbability * weights.similarity;
+      const sampleFactor = clamp(similarity.matches / 24, 0.45, 1);
+      const consensusFactor = consensusVotes >= 4 ? 1.08 : consensusVotes === 3 ? 1 : 0.82;
+      const probability = clamp(weightedProbability * sampleFactor * consensusFactor, 0.05, 0.92);
+      const score = clamp(Math.round(probability * 100), 40, 92);
 
       const targetMs = target.getTime();
       const candidate = {
-        id: `server-white-${targetMs}`,
-        targetAt: target.toISOString(),
-        createdAt: new Date().toISOString(),
-        score,
-        expectedGap: expected,
-        sinceAtProjection: since,
-        status: "WAITING",
-        classification: score >= 72 ? "ACTIVE" : "OBSERVATION",
+        id: `server-white-v2-${targetMs}`,
+        engineVersion: "WHITE_V2_SIMILARITY_LEARNING",
+        targetAt: target.toISOString(), createdAt: new Date().toISOString(), score,
+        probability: Number(probability.toFixed(4)), expectedGap: Math.round(expected), sinceAtProjection: since,
+        status: "WAITING", classification: score >= 72 && consensusVotes >= 3 && similarity.matches >= 8 ? "ACTIVE" : "OBSERVATION",
         windowStartAt: new Date(targetMs - 60000).toISOString(),
-        windowEndAt: new Date(targetMs + 120000).toISOString(),
-        processedHouses: 0,
-        sampleQuality: warmup ? "WARMING" : "FULL",
-        intervalsUsed: gaps.length,
+        windowEndAt: new Date(targetMs + 120000).toISOString(), processedHouses: 0,
+        sampleQuality: similarity.matches >= 25 ? "FULL" : similarity.matches >= 8 ? "MODERATE" : "LOW",
+        intervalsUsed: gaps.length, consensusVotes, components, sensorWeights: weights,
         reasons: [
-          `Intervalo projetado ${projectedGap} rodadas; referência ${expected}.`,
-          minuteStat.total ? `Minuto ${String(localMinute).padStart(2, "0")} teve ${Math.round(minuteRate * 100)}% de brancos na amostra.` : "Minuto ainda com pouca recorrência histórica.",
-          `Dispersão recente dos intervalos: ${spread.toFixed(1)}.`,
-          `${recentWhites} brancos nas últimas ${Math.min(120, rounds.length)} rodadas.`,
-          warmup ? `Motor em aquecimento com ${gaps.length} intervalo(s) real(is).` : `Base completa com ${gaps.length} intervalos.`
+          `Similaridade: ${similarity.matches} cenários; chance histórica ${(similarityProbability * 100).toFixed(0)}%.`,
+          `Consenso: ${consensusVotes}/5 sensores favoráveis.`,
+          `Intervalo projetado ${projectedGap}; referência ${Math.round(expected)}.`,
+          `Minuto ${String(localMinute).padStart(2, "0")}: taxa ajustada ${(minuteProbability * 100).toFixed(0)}%.`,
+          `Aprendizado contínuo: ${this.learning.operations || 0} operações avaliadas.`
         ]
       };
-
-      if (!best || candidate.score > best.score || (candidate.score === best.score && targetMs < new Date(best.targetAt).getTime())) {
-        best = candidate;
-      }
+      if (!best || candidate.score > best.score || (candidate.score === best.score && targetMs < new Date(best.targetAt).getTime())) best = candidate;
     }
-
     return best && best.score >= 58 ? best : null;
   }
   async ensureProjection() {
@@ -214,7 +324,7 @@ class SigmaWhiteEngine {
     const candidate = this.projectNextWhite();
     if (!candidate) return;
     this.active = candidate;
-    if (candidate.score >= 72) await this.sendSignal(candidate);
+    if (candidate.classification === "ACTIVE") await this.sendSignal(candidate);
     this.emitState();
   }
   async handleRound(round) {
@@ -229,9 +339,16 @@ class SigmaWhiteEngine {
       const candidate = this.projectNextWhite();
       if (candidate && Date.now() < start && (candidate.score >= this.active.score + 3 || (candidate.score >= 72 && this.active.score < 72))) {
         this.active = candidate;
-        if (candidate.score >= 72) await this.sendSignal(candidate);
+        if (candidate.classification === "ACTIVE") await this.sendSignal(candidate);
         this.emitState();
       }
+      return;
+    }
+    if (time >= start && this.active.classification !== "ACTIVE") {
+      // Candidatos em observação nunca viram operação real nem bloqueiam o motor.
+      this.active = null;
+      this.emitState();
+      await this.ensureProjection();
       return;
     }
     if (time >= end) {
@@ -258,9 +375,10 @@ class SigmaWhiteEngine {
     const finished = { ...this.active, status, result, house, resolvedAt: roundTime(round) };
     this.history.unshift(finished);
     this.history = this.history.slice(0, 20);
-    if (finished.score >= 72) {
+    if (finished.classification === "ACTIVE" || finished.score >= 72) {
       this.operationArchive.unshift(finished);
       this.operationArchive = this.operationArchive.slice(0, 2500);
+      this.updateLearning(finished);
       await this.sendResult(finished);
     }
     this.active = null;
