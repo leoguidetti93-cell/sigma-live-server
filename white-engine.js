@@ -57,6 +57,7 @@ class SigmaWhiteEngine {
       status: "NOT_EVALUATED"
     };
     this.learningFile = process.env.WHITE_LEARNING_FILE || "/var/data/sigma-white-learning.json";
+    this.historyFile = process.env.WHITE_HISTORY_FILE || "/var/data/sigma-white-history.json";
     this.learning = {
       version: 2,
       operations: 0,
@@ -70,8 +71,45 @@ class SigmaWhiteEngine {
       }
     };
     this.loadLearning();
+    this.loadHistoryState();
   }
 
+
+  loadHistoryState() {
+    try {
+      if (!fs.existsSync(this.historyFile)) return;
+      const saved = JSON.parse(fs.readFileSync(this.historyFile, "utf8"));
+      if (Array.isArray(saved?.history)) this.history = saved.history.slice(0, 200);
+      this.lastHourlySummaryKey = saved?.lastHourlySummaryKey || this.lastHourlySummaryKey;
+      this.lastDailySummaryKey = saved?.lastDailySummaryKey || this.lastDailySummaryKey;
+      console.log(`[SIGMA WHITE] Histórico restaurado de ${this.historyFile}.`);
+    } catch (error) {
+      console.warn(`[SIGMA WHITE] Falha ao restaurar histórico: ${error?.message || error}`);
+    }
+  }
+
+  saveHistoryState() {
+    const payload = JSON.stringify({
+      savedAt: new Date().toISOString(),
+      history: this.history.slice(0, 200),
+      lastHourlySummaryKey: this.lastHourlySummaryKey,
+      lastDailySummaryKey: this.lastDailySummaryKey
+    });
+    const trySave = file => {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.tmp`;
+      fs.writeFileSync(tmp, payload, "utf8");
+      fs.renameSync(tmp, file);
+    };
+    try {
+      trySave(this.historyFile);
+    } catch (error) {
+      if (this.historyFile.startsWith("/var/data/")) {
+        this.historyFile = path.join(__dirname, "data", "sigma-white-history.json");
+        try { trySave(this.historyFile); } catch (_) {}
+      }
+    }
+  }
 
   loadLearning() {
     try {
@@ -394,14 +432,14 @@ class SigmaWhiteEngine {
         engineVersion: "WHITE_V2_3_SCORE_NORMALIZADO_TELEMETRIA",
         targetAt: target.toISOString(), createdAt: new Date().toISOString(), score, rawScore: Number(rawStrength.toFixed(1)),
         signalTier: this.signalTier(score), probability: Number(probability.toFixed(4)), expectedGap: Math.round(expected), sinceAtProjection: since,
-        status: "WAITING", classification: score >= 72 && (consensusVotes >= 4 || (score >= 79 && consensusVotes >= 3)) ? "ACTIVE" : "OBSERVATION",
+        status: "WAITING", classification: score >= 72 && consensusVotes >= 3 ? "ACTIVE" : "OBSERVATION",
         windowStartAt: new Date(targetMs - 60000).toISOString(),
         windowEndAt: new Date(targetMs + 120000).toISOString(), processedHouses: 0,
         sampleQuality: gaps.length >= 40 ? "FULL" : gaps.length >= 12 ? "MODERATE" : "LOW",
         intervalsUsed: gaps.length, consensusVotes, components, sensorWeights: weights,
         reasons: [
           `Similaridade: ${similarity.matches} cenários; chance histórica ${(similarityProbability * 100).toFixed(0)}%.`,
-          `Consenso: ${consensusVotes}/6 sensores favoráveis (${score >= 79 ? "mínimo 3" : "mínimo 4"}).`,
+          `Consenso: ${consensusVotes}/6 sensores favoráveis (mínimo 3).`,
           `Intervalo projetado ${projectedGap}; referência ${Math.round(expected)}.`,
           `Pressão estatística: percentil ${(pressurePercentile * 100).toFixed(0)}%.`,
           `Minuto ${String(localMinute).padStart(2, "0")}: taxa ajustada ${(minuteProbability * 100).toFixed(0)}%.`,
@@ -420,7 +458,7 @@ class SigmaWhiteEngine {
       lastEvaluationAt: new Date().toISOString(),
       status: best ? (best.classification === "ACTIVE" ? "SIGNAL_READY" : "OBSERVING") : "NO_CANDIDATE",
       minimumScore: 72,
-      rule: "72-78: 4/6 | 79+: 3/6"
+      rule: "Score 72+ e mínimo 3/6 sensores"
     };
     // Mantém sempre o melhor candidato visível em observação, mesmo com score baixo.
     // A publicação no Telegram continua restrita às regras de score e consenso.
@@ -534,6 +572,7 @@ class SigmaWhiteEngine {
     const finished = { ...this.active, status, result, house, resolvedAt: roundTime(round) };
     this.history.unshift(finished);
     this.history = this.history.slice(0, 20);
+    this.saveHistoryState();
     if (finished.classification === "ACTIVE" || finished.score >= 72) {
       this.operationArchive.unshift(finished);
       this.operationArchive = this.operationArchive.slice(0, 2500);
@@ -652,6 +691,7 @@ class SigmaWhiteEngine {
       const key = this.localHourKey(now);
       if (this.lastHourlySummaryKey !== key) {
         this.lastHourlySummaryKey = key;
+      this.saveHistoryState();
         await this.sendHourlySummary(now);
       }
     }

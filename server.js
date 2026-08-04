@@ -14,7 +14,7 @@ const SigmaColorEngine = require("./color-engine");
 const SigmaWhiteEngine = require("./white-engine");
 const HistoryLoader = require("./history-loader");
 
-const APP_VERSION = "1.5.11";
+const APP_VERSION = "1.5.12";
 const ACCESS_TABLE = "sigma_access";
 const LICENSE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LICENSE_LENGTH = 6;
@@ -354,7 +354,13 @@ app.get("/health", (_req, res) => {
       restored: restoredCount,
       lastError: memoryStore.lastError,
       fallbackUsed: Boolean(memoryStore.fallbackUsed),
-      persistentDiskActive: memoryStore.filepath.startsWith("/var/data/")
+      persistentDiskActive: memoryStore.filepath.startsWith("/var/data/"),
+      files: {
+        rounds: memoryStore.filepath,
+        whiteLearning: whiteEngine?.learningFile || null,
+        whiteHistory: whiteEngine?.historyFile || null,
+        colorState: colorEngine?.stateFile || null
+      }
     },
     historyBackfill: historyLoader.state(),
     whiteDiagnostics: (() => {

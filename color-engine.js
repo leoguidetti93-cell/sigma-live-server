@@ -1,6 +1,8 @@
 "use strict";
 
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const pct = (n, d) => d ? Math.round((n / d) * 100) : 0;
@@ -68,6 +70,51 @@ class SigmaColorEngine {
     this.lastSignalAnchorKey = "";
     this.summaryState = {};
     this.timer = null;
+    this.stateFile = process.env.COLOR_STATE_FILE || "/var/data/sigma-color-state.json";
+    this.stateSaveTimer = null;
+    this.loadPersistentState();
+  }
+
+  loadPersistentState() {
+    try {
+      if (!fs.existsSync(this.stateFile)) return;
+      const saved = JSON.parse(fs.readFileSync(this.stateFile, "utf8"));
+      if (Array.isArray(saved?.history)) this.history = saved.history.slice(0, 200);
+      if (saved?.stats && typeof saved.stats === "object") this.stats = saved.stats;
+      if (saved?.summaryState && typeof saved.summaryState === "object") this.summaryState = saved.summaryState;
+      console.log(`[SIGMA COLOR] Estado restaurado de ${this.stateFile}.`);
+    } catch (error) {
+      console.warn(`[SIGMA COLOR] Falha ao restaurar estado: ${error?.message || error}`);
+    }
+  }
+
+  schedulePersistentState() {
+    clearTimeout(this.stateSaveTimer);
+    this.stateSaveTimer = setTimeout(() => this.savePersistentState(), 500);
+    this.stateSaveTimer.unref?.();
+  }
+
+  savePersistentState() {
+    const payload = JSON.stringify({
+      savedAt: new Date().toISOString(),
+      history: this.history.slice(0, 200),
+      stats: this.stats,
+      summaryState: this.summaryState
+    });
+    const trySave = file => {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.tmp`;
+      fs.writeFileSync(tmp, payload, "utf8");
+      fs.renameSync(tmp, file);
+    };
+    try {
+      trySave(this.stateFile);
+    } catch (error) {
+      if (this.stateFile.startsWith("/var/data/")) {
+        this.stateFile = path.join(__dirname, "data", "sigma-color-state.json");
+        try { trySave(this.stateFile); } catch (_) {}
+      }
+    }
   }
 
   start() {
@@ -440,12 +487,14 @@ Manter entrada no ${colorEmoji(operation.target)} ${colorName(operation.target)}
       const bucket = this.stats.sessions[previousSlot] || this.emptyStats();
       await this.sendSummary("SESSION", bucket, previousSlot);
       this.summaryState.lastSessionSent = previousSlot;
+      this.schedulePersistentState();
     }
     this.summaryState.currentSlot = currentSlot;
     const p = dayParts(now), today = dayKey(now);
     if (p.hour === "23" && p.minute === "59" && this.summaryState.lastDailySent !== today) {
       await this.sendSummary("DAILY", this.stats.days[today] || this.emptyStats(), today);
       this.summaryState.lastDailySent = today;
+      this.schedulePersistentState();
     }
   }
 
