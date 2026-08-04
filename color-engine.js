@@ -377,7 +377,10 @@ class SigmaColorEngine {
     try {
       let text = "";
       if (type === "SIGNAL") {
-        text = `Σ SIGMA LEITURA • COLOR\n\n🎯 Entrada: ${colorEmoji(operation.target)} ${colorName(operation.target)}\n⚪ Proteção no branco\n🛡 Cobertura até G1\n📊 Score: ${operation.score}`;
+        const coverage = operation.g2Enabled
+          ? "🛡 Cobertura até G1\n🔥 G2 OPCIONAL HABILITADO"
+          : "🛡 Cobertura até G1";
+        text = `Σ SIGMA LEITURA • COLOR\n\n🎯 Entrada: ${colorEmoji(operation.target)} ${colorName(operation.target)}\n⚪ Proteção no branco\n${coverage}\n📊 Score: ${operation.score}`;
       } else if (type === "G1") {
         text = `🛡 G1 LIBERADO\n\nManter entrada no ${colorEmoji(operation.target)} ${colorName(operation.target)}\n⚪ Proteção no branco`;
       } else if (type === "G2") {

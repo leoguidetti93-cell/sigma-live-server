@@ -44,6 +44,15 @@ class SigmaWhiteEngine {
     this.operationArchive = [];
     this.lastHourlySummaryKey = null;
     this.lastDailySummaryKey = null;
+    this.whiteDebug = {
+      evaluated: 0,
+      bestScore: null,
+      bestVotes: null,
+      bestTargetAt: null,
+      bestClassification: null,
+      lastEvaluationAt: null,
+      status: "NOT_EVALUATED"
+    };
     this.learningFile = process.env.WHITE_LEARNING_FILE || "/var/data/sigma-white-learning.json";
     this.learning = {
       version: 2,
@@ -224,6 +233,7 @@ class SigmaWhiteEngine {
       cooldownUntil: this.cooldownUntil,
       diagnostics: this.diagnostics(),
       learning: { operations: this.learning.operations || 0, weights: this.sensorWeights(), sensors: this.learning.sensors },
+      whiteDebug: this.whiteDebug,
       updatedAt: new Date().toISOString()
     };
   }
@@ -252,7 +262,15 @@ class SigmaWhiteEngine {
   projectNextWhite() {
     const rounds = this.chronologicalRounds();
     const { gaps, since } = this.whiteGaps(rounds);
-    if (gaps.length < 5 || rounds.length < 300) return null;
+    if (gaps.length < 5 || rounds.length < 300) {
+      this.whiteDebug = {
+        evaluated: 0, bestScore: null, bestVotes: null, bestTargetAt: null,
+        bestClassification: null, lastEvaluationAt: new Date().toISOString(),
+        status: gaps.length < 5 ? "WAITING_INTERVALS" : "WAITING_MEMORY",
+        rounds: rounds.length, intervals: gaps.length
+      };
+      return null;
+    }
 
     const recent = gaps.slice(-60);
     const weightTotal = recent.reduce((sum, _, i) => sum + i + 1, 0);
@@ -270,8 +288,10 @@ class SigmaWhiteEngine {
     const now = new Date();
     now.setSeconds(0, 0);
     let best = null;
+    let evaluated = 0;
 
     for (let minuteOffset = 2; minuteOffset <= 240; minuteOffset += 1) {
+      evaluated += 1;
       const target = new Date(now.getTime() + minuteOffset * 60000);
       const horizonRounds = minuteOffset * 2;
       const projectedGap = since + horizonRounds;
@@ -322,7 +342,7 @@ class SigmaWhiteEngine {
       const targetMs = target.getTime();
       const candidate = {
         id: `server-white-v2-${targetMs}`,
-        engineVersion: "WHITE_V2_1_CALIBRACAO_32_22_15_10_10_11",
+        engineVersion: "WHITE_V2_2_CANDIDATO_CONTINUO_DEBUG",
         targetAt: target.toISOString(), createdAt: new Date().toISOString(), score,
         probability: Number(probability.toFixed(4)), expectedGap: Math.round(expected), sinceAtProjection: since,
         status: "WAITING", classification: score >= 72 && (consensusVotes >= 4 || (score >= 79 && consensusVotes >= 3)) ? "ACTIVE" : "OBSERVATION",
@@ -341,7 +361,20 @@ class SigmaWhiteEngine {
       };
       if (!best || candidate.score > best.score || (candidate.score === best.score && targetMs < new Date(best.targetAt).getTime())) best = candidate;
     }
-    return best && best.score >= 58 ? best : null;
+    this.whiteDebug = {
+      evaluated,
+      bestScore: best?.score ?? null,
+      bestVotes: best?.consensusVotes ?? null,
+      bestTargetAt: best?.targetAt ?? null,
+      bestClassification: best?.classification ?? null,
+      lastEvaluationAt: new Date().toISOString(),
+      status: best ? (best.classification === "ACTIVE" ? "SIGNAL_READY" : "OBSERVING") : "NO_CANDIDATE",
+      minimumScore: 72,
+      rule: "72-78: 4/6 | 79+: 3/6"
+    };
+    // Mantém sempre o melhor candidato visível em observação, mesmo com score baixo.
+    // A publicação no Telegram continua restrita às regras de score e consenso.
+    return best || null;
   }
   async ensureProjection() {
     if (this.active || !this.enabled || this.settling) return;
@@ -366,9 +399,16 @@ class SigmaWhiteEngine {
     const end = new Date(this.active.windowEndAt).getTime();
     if (time < start) {
       const candidate = this.projectNextWhite();
-      if (candidate && Date.now() < start && (candidate.score >= this.active.score + 3 || (candidate.score >= 72 && this.active.score < 72))) {
+      const currentWasActive = this.active.classification === "ACTIVE";
+      const candidateIsActive = candidate?.classification === "ACTIVE";
+      const shouldReplace = candidate && Date.now() < start && (
+        !currentWasActive ||
+        candidate.score >= this.active.score + 3 ||
+        (candidateIsActive && !currentWasActive)
+      );
+      if (shouldReplace) {
         this.active = candidate;
-        if (candidate.classification === "ACTIVE") await this.sendSignal(candidate);
+        if (candidateIsActive && !currentWasActive) await this.sendSignal(candidate);
         this.emitState();
       }
       return;
