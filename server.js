@@ -14,7 +14,7 @@ const SigmaColorEngine = require("./color-engine");
 const SigmaWhiteEngine = require("./white-engine");
 const HistoryLoader = require("./history-loader");
 
-const APP_VERSION = "1.5.10";
+const APP_VERSION = "1.5.11";
 const ACCESS_TABLE = "sigma_access";
 const LICENSE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LICENSE_LENGTH = 6;
@@ -837,7 +837,7 @@ app.post("/memory/bootstrap", async (req, res) => {
     const saved = memoryStore.save(memory.all());
     console.log(`[MEMORY] Bootstrap recebido do ORION: ${inserted} novas | total=${memory.size()}.`);
     broadcast("memory-bootstrap", { inserted, count: memory.size() });
-    await whiteEngine?.ensureProjection?.();
+    await whiteEngine?.ensureProjection?.(true);
     return res.json({ ok: true, inserted, before, count: memory.size(), memoryLimit: config.memoryLimit, persisted: saved, persistenceFile: memoryStore.filepath });
   } catch (error) {
     console.error("[MEMORY] Erro no bootstrap:", error);

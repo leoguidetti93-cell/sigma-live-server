@@ -41,7 +41,6 @@ class SigmaWhiteEngine {
     this.cooldownTimer = null;
     this.summaryTimer = null;
     this.evaluationTimer = null;
-    this.evaluationTimer = null;
     this.settling = false;
     this.operationArchive = [];
     this.observationArchive = [];
