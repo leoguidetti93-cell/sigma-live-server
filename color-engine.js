@@ -301,9 +301,20 @@ class SigmaColorEngine {
     if (this.operation) {
       if (key === this.operation.anchorKey || key === this.operation.lastProcessedRoundKey) return;
       this.operation.lastProcessedRoundKey = key;
-      if (this.operation.phase === "G1") {
-        const result = color === this.operation.target ? "WIN G1" : color === "white" ? "WIN BRANCO" : "LOSS";
+      if (this.operation.phase === "G2") {
+        const result = color === this.operation.target ? "WIN G2" : color === "white" ? "WIN BRANCO" : "LOSS";
         await this.settle(result, round);
+      } else if (this.operation.phase === "G1") {
+        if (color === this.operation.target) await this.settle("WIN G1", round);
+        else if (color === "white") await this.settle("WIN BRANCO", round);
+        else if (this.operation.g2Enabled) {
+          this.operation.phase = "G2";
+          this.operation.g2StartedAt = roundTime(round);
+          await this.sendEvent("G2", this.operation, { secondColor: color });
+          this.emitState();
+        } else {
+          await this.settle("LOSS", round);
+        }
       } else {
         if (color === this.operation.target) await this.settle("WIN DIRETA", round);
         else if (color === "white") await this.settle("WIN BRANCO", round);
@@ -328,6 +339,7 @@ class SigmaColorEngine {
     this.operation = {
       id: `server-color-${suggestion.anchorKey}-${suggestion.target}-${crypto.randomBytes(3).toString("hex")}`,
       ...suggestion,
+      g2Enabled: suggestion.score >= 84,
       phase: "DIRECT",
       createdAt: new Date().toISOString(),
       source: "SIGMA_SERVER_24H"
@@ -368,6 +380,12 @@ class SigmaColorEngine {
         text = `Σ SIGMA LEITURA • COLOR\n\n🎯 Entrada: ${colorEmoji(operation.target)} ${colorName(operation.target)}\n⚪ Proteção no branco\n🛡 Cobertura até G1\n📊 Score: ${operation.score}`;
       } else if (type === "G1") {
         text = `🛡 G1 LIBERADO\n\nManter entrada no ${colorEmoji(operation.target)} ${colorName(operation.target)}\n⚪ Proteção no branco`;
+      } else if (type === "G2") {
+        text = `🔥 G2 OPCIONAL LIBERADO
+
+Manter entrada no ${colorEmoji(operation.target)} ${colorName(operation.target)}
+⚪ Proteção no branco
+📊 Score: ${operation.score}`;
       } else if (type === "RESULT") {
         const icon = operation.result === "LOSS" ? "❌" : operation.result === "WIN BRANCO" ? "⚪" : "✅";
         const detail = operation.result === "WIN BRANCO" ? "PROTEÇÃO NO BRANCO" : `${colorEmoji(operation.target)} ${colorName(operation.target)}`;
@@ -395,7 +413,7 @@ class SigmaColorEngine {
     return data.result;
   }
 
-  emptyStats() { return { signals: 0, wins: 0, losses: 0, whites: 0, direct: 0, g1: 0 }; }
+  emptyStats() { return { signals: 0, wins: 0, losses: 0, whites: 0, direct: 0, g1: 0, g2: 0 }; }
 
   recordStats(item) {
     const dKey = dayKey(new Date(item.resolvedAt));
@@ -404,7 +422,7 @@ class SigmaColorEngine {
       bucket.signals += 1;
       if (item.result === "LOSS") bucket.losses += 1;
       else if (item.result === "WIN BRANCO") bucket.whites += 1;
-      else { bucket.wins += 1; if (item.result === "WIN DIRETA") bucket.direct += 1; if (item.result === "WIN G1") bucket.g1 += 1; }
+      else { bucket.wins += 1; if (item.result === "WIN DIRETA") bucket.direct += 1; if (item.result === "WIN G1") bucket.g1 += 1; if (item.result === "WIN G2") bucket.g2 += 1; }
     }
   }
 
