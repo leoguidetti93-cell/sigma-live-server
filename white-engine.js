@@ -40,6 +40,8 @@ class SigmaWhiteEngine {
     this.watchdog = null;
     this.cooldownTimer = null;
     this.summaryTimer = null;
+    this.evaluationTimer = null;
+    this.evaluationTimer = null;
     this.settling = false;
     this.operationArchive = [];
     this.observationArchive = [];
@@ -192,7 +194,24 @@ class SigmaWhiteEngine {
   start() {
     console.log(`[SIGMA WHITE] Motor 24h ${this.enabled ? "ATIVO" : "DESATIVADO"}. Telegram=${Boolean(this.telegramToken && this.telegramChatId)}`);
     if (this.enabled) {
-      this.ensureProjection();
+      // Avalia imediatamente após o restore da memória. O atraso curto evita
+      // competir com a inicialização do socket e garante que o estado apareça
+      // no site mesmo antes da próxima rodada ao vivo.
+      setTimeout(() => {
+        this.processing = this.processing
+          .then(() => this.ensureProjection())
+          .catch(error => console.error("[SIGMA WHITE] avaliação inicial", error));
+      }, 1200).unref?.();
+
+      // Gatilho independente: se o stream atrasar ou não chegar rodada nova,
+      // o candidato continua sendo recalculado e publicado no site.
+      this.evaluationTimer = setInterval(() => {
+        this.processing = this.processing
+          .then(() => this.ensureProjection(true))
+          .catch(error => console.error("[SIGMA WHITE] avaliação periódica", error));
+      }, 15000);
+      this.evaluationTimer.unref?.();
+
       this.watchdog = setInterval(() => this.checkOperationTimeout(), 5000);
       this.watchdog.unref?.();
       this.summaryTimer = setInterval(() => this.checkScheduledSummaries().catch(error => console.error("[SIGMA WHITE] resumo", error)), 15000);
@@ -204,9 +223,11 @@ class SigmaWhiteEngine {
     if (this.watchdog) clearInterval(this.watchdog);
     if (this.cooldownTimer) clearTimeout(this.cooldownTimer);
     if (this.summaryTimer) clearInterval(this.summaryTimer);
+    if (this.evaluationTimer) clearInterval(this.evaluationTimer);
     this.watchdog = null;
     this.cooldownTimer = null;
     this.summaryTimer = null;
+    this.evaluationTimer = null;
   }
   chronologicalRounds() {
     return this.memory.all().slice().reverse().map(r => ({ ...r, color: normalizeColor(r), createdAt: roundTime(r) }));
@@ -345,7 +366,6 @@ class SigmaWhiteEngine {
         minute: { probability: minuteProbability },
         similarity: { probability: similarityProbability, matches: similarity.matches, confidence: similarity.confidence }
       };
-      Object.entries(normalized).forEach(([key, strength]) => { components[key].strength = Number((strength * 100).toFixed(1)); });
       const normalized = {
         gap: this.normalizeSensor(gapProbability, 0.06, 0.84),
         pressure: this.normalizeSensor(pressureProbability, 0.10, 0.78),
@@ -354,6 +374,9 @@ class SigmaWhiteEngine {
         minute: this.normalizeSensor(minuteProbability, 0.08, 0.78),
         similarity: this.normalizeSensor(similarityProbability, 0.05, 0.92)
       };
+      Object.entries(normalized).forEach(([key, strength]) => {
+        components[key].strength = Number((strength * 100).toFixed(1));
+      });
       const consensusVotes = Object.values(normalized).filter(v => v >= 0.55).length;
       const rawStrength = (
         normalized.gap * weights.gap +
@@ -404,15 +427,21 @@ class SigmaWhiteEngine {
     // A publicação no Telegram continua restrita às regras de score e consenso.
     return best || null;
   }
-  async ensureProjection() {
-    if (this.active || !this.enabled || this.settling) return;
+  async ensureProjection(forceRefresh = false) {
+    if (!this.enabled || this.settling) return;
+    if (this.active && (!forceRefresh || this.active.classification === "ACTIVE" || this.active.status === "IN_OPERATION")) return;
     if (this.cooldownUntil && Date.now() < new Date(this.cooldownUntil).getTime()) {
       this.emitState();
       return;
     }
     this.cooldownUntil = null;
     const candidate = this.projectNextWhite();
-    if (!candidate) return;
+    if (!candidate) {
+      this.emitState();
+      return;
+    }
+    // No modo observação, o candidato pode mudar a cada avaliação. Uma operação
+    // já publicada nunca é substituída.
     this.active = candidate;
     if (candidate.classification === "ACTIVE") await this.sendSignal(candidate);
     this.emitState();
@@ -638,7 +667,11 @@ class SigmaWhiteEngine {
   }
 
   async checkOperationTimeout() {
-    if (!this.enabled || !this.active || this.settling) return;
+    if (!this.enabled || this.settling) return;
+    if (!this.active) {
+      await this.ensureProjection(true);
+      return;
+    }
     const end = new Date(this.active.windowEndAt).getTime();
     if (!Number.isFinite(end)) return;
     // Dá 30 segundos de tolerância para atrasos normais do stream.
