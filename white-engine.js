@@ -51,8 +51,9 @@ class SigmaWhiteEngine {
       sensors: {
         gap: { mae: 0.30, n: 0 },
         minute: { mae: 0.30, n: 0 },
-        stability: { mae: 0.30, n: 0 },
+        pressure: { mae: 0.30, n: 0 },
         density: { mae: 0.30, n: 0 },
+        dispersion: { mae: 0.30, n: 0 },
         similarity: { mae: 0.26, n: 0 }
       }
     };
@@ -64,7 +65,15 @@ class SigmaWhiteEngine {
     try {
       if (!fs.existsSync(this.learningFile)) return;
       const saved = JSON.parse(fs.readFileSync(this.learningFile, "utf8"));
-      if (saved?.learning?.sensors) this.learning = saved.learning;
+      if (saved?.learning?.sensors) {
+        this.learning = saved.learning;
+        // Migração transparente do nome antigo "stability" para "dispersion".
+        if (!this.learning.sensors.dispersion && this.learning.sensors.stability) {
+          this.learning.sensors.dispersion = this.learning.sensors.stability;
+        }
+        if (!this.learning.sensors.pressure) this.learning.sensors.pressure = { mae: 0.30, n: 0 };
+        delete this.learning.sensors.stability;
+      }
       if (Array.isArray(saved?.operationArchive)) this.operationArchive = saved.operationArchive.slice(0, 2500);
       console.log(`[SIGMA WHITE V2] Aprendizado restaurado: ${this.learning.operations || 0} operações.`);
     } catch (error) {
@@ -89,15 +98,17 @@ class SigmaWhiteEngine {
     }
   }
   sensorWeights() {
-    const base = { gap: 0.22, minute: 0.10, stability: 0.08, density: 0.08, similarity: 0.52 };
-    const scored = Object.fromEntries(Object.entries(base).map(([key, value]) => {
-      const sensor = this.learning.sensors[key] || { mae: 0.30, n: 0 };
-      const experience = clamp((sensor.n || 0) / 80, 0, 1);
-      const reliability = 1 / (0.12 + clamp(sensor.mae || 0.30, 0.08, 0.65));
-      return [key, value * ((1 - experience) + experience * reliability / 2.6)];
-    }));
-    const total = Object.values(scored).reduce((a, b) => a + b, 0) || 1;
-    return Object.fromEntries(Object.entries(scored).map(([k, v]) => [k, v / total]));
+    // Calibração experimental solicitada para o WHITE V2.1.
+    // Os pesos ficam fixos durante este teste; o aprendizado contínuo segue
+    // registrando desempenho dos sensores, sem alterar esta distribuição.
+    return {
+      gap: 0.32,
+      pressure: 0.22,
+      density: 0.15,
+      dispersion: 0.10,
+      minute: 0.10,
+      similarity: 0.11
+    };
   }
   patternSimilarity(rounds, aEnd, bEnd, length) {
     let score = 0;
@@ -269,43 +280,61 @@ class SigmaWhiteEngine {
       const minuteStat = minuteModel[localMinute];
       const minuteRate = minuteStat.total ? minuteStat.white / minuteStat.total : recentDensity;
       const minuteProbability = clamp(0.12 + minuteRate * 3.2, 0.08, 0.78);
-      const stabilityProbability = clamp(0.68 - spread / 45, 0.12, 0.72);
+      const dispersionProbability = clamp(0.68 - spread / 45, 0.12, 0.72);
       const densityProbability = clamp(0.16 + recentDensity * 3.0, 0.10, 0.68);
+
+      // Pressão estatística: mede o quanto o intervalo projetado avançou dentro
+      // da distribuição real dos intervalos entre brancos. Quanto maior o
+      // percentil, maior a pressão, mas sem transformar atraso em certeza.
+      const sortedGaps = [...recent].sort((a, b) => a - b);
+      const pressurePercentile = sortedGaps.filter(g => g <= projectedGap).length / Math.max(1, sortedGaps.length);
+      const pressureProbability = clamp(0.12 + pressurePercentile * 0.66, 0.10, 0.78);
+
       const similarity = this.similarityForecast(rounds, since, horizonRounds);
       const similarityProbability = similarity.probability;
 
       const components = {
         gap: { probability: gapProbability },
-        minute: { probability: minuteProbability },
-        stability: { probability: stabilityProbability },
+        pressure: { probability: pressureProbability, percentile: pressurePercentile },
         density: { probability: densityProbability },
+        dispersion: { probability: dispersionProbability },
+        minute: { probability: minuteProbability },
         similarity: { probability: similarityProbability, matches: similarity.matches, confidence: similarity.confidence }
       };
-      const consensusVotes = [gapProbability, minuteProbability, stabilityProbability, densityProbability, similarityProbability].filter(p => p >= 0.48).length;
+      const consensusVotes = [
+        gapProbability,
+        pressureProbability,
+        densityProbability,
+        dispersionProbability,
+        minuteProbability,
+        similarityProbability
+      ].filter(p => p >= 0.48).length;
       const weightedProbability =
-        gapProbability * weights.gap + minuteProbability * weights.minute +
-        stabilityProbability * weights.stability + densityProbability * weights.density +
+        gapProbability * weights.gap +
+        pressureProbability * weights.pressure +
+        densityProbability * weights.density +
+        dispersionProbability * weights.dispersion +
+        minuteProbability * weights.minute +
         similarityProbability * weights.similarity;
-      const sampleFactor = clamp(similarity.matches / 24, 0.45, 1);
-      const consensusFactor = consensusVotes >= 4 ? 1.08 : consensusVotes === 3 ? 1 : 0.82;
-      const probability = clamp(weightedProbability * sampleFactor * consensusFactor, 0.05, 0.92);
+      const probability = clamp(weightedProbability, 0.05, 0.92);
       const score = clamp(Math.round(probability * 100), 40, 92);
 
       const targetMs = target.getTime();
       const candidate = {
         id: `server-white-v2-${targetMs}`,
-        engineVersion: "WHITE_V2_SIMILARITY_LEARNING",
+        engineVersion: "WHITE_V2_1_CALIBRACAO_32_22_15_10_10_11",
         targetAt: target.toISOString(), createdAt: new Date().toISOString(), score,
         probability: Number(probability.toFixed(4)), expectedGap: Math.round(expected), sinceAtProjection: since,
-        status: "WAITING", classification: score >= 72 && consensusVotes >= 3 && similarity.matches >= 8 ? "ACTIVE" : "OBSERVATION",
+        status: "WAITING", classification: score >= 72 && consensusVotes >= 4 ? "ACTIVE" : "OBSERVATION",
         windowStartAt: new Date(targetMs - 60000).toISOString(),
         windowEndAt: new Date(targetMs + 120000).toISOString(), processedHouses: 0,
-        sampleQuality: similarity.matches >= 25 ? "FULL" : similarity.matches >= 8 ? "MODERATE" : "LOW",
+        sampleQuality: gaps.length >= 40 ? "FULL" : gaps.length >= 12 ? "MODERATE" : "LOW",
         intervalsUsed: gaps.length, consensusVotes, components, sensorWeights: weights,
         reasons: [
           `Similaridade: ${similarity.matches} cenários; chance histórica ${(similarityProbability * 100).toFixed(0)}%.`,
-          `Consenso: ${consensusVotes}/5 sensores favoráveis.`,
+          `Consenso: ${consensusVotes}/6 sensores favoráveis.`,
           `Intervalo projetado ${projectedGap}; referência ${Math.round(expected)}.`,
+          `Pressão estatística: percentil ${(pressurePercentile * 100).toFixed(0)}%.`,
           `Minuto ${String(localMinute).padStart(2, "0")}: taxa ajustada ${(minuteProbability * 100).toFixed(0)}%.`,
           `Aprendizado contínuo: ${this.learning.operations || 0} operações avaliadas.`
         ]
