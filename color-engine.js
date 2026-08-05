@@ -69,6 +69,7 @@ class SigmaColorEngine {
     this.nextSignalAllowedAt = 0;
     this.lastSignalAnchorKey = "";
     this.summaryState = {};
+    this.patternState = { evaluatedAt: null, active: null, top: [], qualified: 0 };
     this.timer = null;
     this.stateFile = process.env.COLOR_STATE_FILE || "/var/data/sigma-color-state.json";
     this.stateSaveTimer = null;
@@ -135,6 +136,7 @@ class SigmaColorEngine {
       nextSignalAllowedAt: this.nextSignalAllowedAt,
       telegramConfigured: Boolean(this.telegramToken && this.telegramChatId),
       stats: this.stats.days[dayKey()] || this.emptyStats(),
+      patternLab: this.patternState,
       updatedAt: new Date().toISOString()
     };
   }
@@ -314,6 +316,98 @@ class SigmaColorEngine {
     return best;
   }
 
+
+  patternToken(round, mode) {
+    if (mode === "N") return `N${this.roundNumber(round)}`;
+    return `C${round?.color || normalizeColor(round)}`;
+  }
+
+  patternLabel(tokens) {
+    return tokens.map(token => {
+      if (token === "Cred") return "🔴";
+      if (token === "Cblack") return "⚫";
+      if (token === "Cwhite") return "⚪";
+      return String(token).replace(/^N/, "");
+    }).join(" + ");
+  }
+
+  evaluatePatternSchema(rounds, modes, target) {
+    const len = modes.length;
+    if (rounds.length < len + 4) return null;
+    const currentTokens = rounds.slice(-len).map((round, index) => this.patternToken(round, modes[index]));
+    let direct = 0, g1 = 0, g2 = 0, white = 0, loss = 0, cases = 0;
+
+    // Mantém três rodadas posteriores disponíveis para medir Direta, G1 e G2.
+    for (let end = len - 1; end <= rounds.length - 4; end++) {
+      let match = true;
+      for (let j = 0; j < len; j++) {
+        if (this.patternToken(rounds[end - len + 1 + j], modes[j]) !== currentTokens[j]) { match = false; break; }
+      }
+      if (!match) continue;
+      cases += 1;
+      const future = [rounds[end + 1]?.color, rounds[end + 2]?.color, rounds[end + 3]?.color];
+      if (future[0] === target) direct += 1;
+      else if (future[0] === "white") white += 1;
+      else if (future[1] === target) g1 += 1;
+      else if (future[1] === "white") white += 1;
+      else if (future[2] === target) g2 += 1;
+      else if (future[2] === "white") white += 1;
+      else loss += 1;
+    }
+    if (!cases) return null;
+    const successG1 = pct(direct + g1 + white, cases);
+    const successG2 = pct(direct + g1 + g2 + white, cases);
+    const support = Math.min(1, cases / 30);
+    const adjustedG1 = Math.round(50 + (successG1 - 50) * support);
+    const adjustedG2 = Math.round(50 + (successG2 - 50) * support);
+    const numberTokens = modes.filter(mode => mode === "N").length;
+    const specificity = numberTokens / len;
+    const strength = Math.max(0, Math.min(99, Math.round(adjustedG1 * 0.72 + adjustedG2 * 0.20 + Math.min(8, specificity * 8))));
+    const qualified = cases >= 12 && successG1 >= 65;
+    return {
+      modes, tokens: currentTokens, label: this.patternLabel(currentTokens), target, cases, direct, g1, g2, white, loss,
+      successG1, successG2, adjustedG1, adjustedG2, strength, specificity: Math.round(specificity * 100), qualified
+    };
+  }
+
+  recurringPatternSensor(rounds) {
+    const schemas = [];
+    // Varre combinações de cor/número em sequências de 2 a 4 casas.
+    for (const len of [3, 4, 2]) {
+      for (let mask = 0; mask < (1 << len); mask++) {
+        const modes = Array.from({ length: len }, (_, i) => (mask & (1 << i)) ? "N" : "C");
+        // Evita padrões longos só de números com suporte quase sempre nulo.
+        if (len === 4 && modes.every(mode => mode === "N")) continue;
+        schemas.push(modes);
+      }
+    }
+    const results = [];
+    for (const modes of schemas) {
+      for (const target of ["red", "black"]) {
+        const result = this.evaluatePatternSchema(rounds, modes, target);
+        if (result && result.cases >= 5) results.push(result);
+      }
+    }
+    results.sort((a, b) => (Number(b.qualified) - Number(a.qualified)) || (b.strength - a.strength) || (b.cases - a.cases));
+    const top = results.slice(0, 12);
+    const qualified = results.filter(item => item.qualified);
+    const bestByTarget = {};
+    for (const target of ["red", "black"]) {
+      bestByTarget[target] = results.filter(item => item.target === target)[0] || null;
+    }
+    const active = qualified[0] || top[0] || null;
+    const state = {
+      evaluatedAt: new Date().toISOString(),
+      active,
+      top,
+      qualified: qualified.length,
+      criteria: { minOccurrences: 12, minSuccessG1: 65 },
+      bestByTarget
+    };
+    this.patternState = state;
+    return state;
+  }
+
   calculateSuggestion() {
     const rounds = this.chronologicalRounds();
     if (rounds.length < 20) return null;
@@ -323,20 +417,38 @@ class SigmaColorEngine {
     const dominant = redP > blackP ? "red" : blackP > redP ? "black" : null;
     const streak = this.currentStreak(rounds);
     const reversal = streak.color === "red" ? "black" : streak.color === "black" ? "red" : dominant;
-    const pattern = this.choosePattern(rounds);
-    const target = pattern?.target || reversal || dominant;
+    const legacyPattern = this.choosePattern(rounds);
+    const recurringPatterns = this.recurringPatternSensor(rounds);
+    let target = legacyPattern?.target || reversal || dominant;
     if (!target) return null;
+
     let baseScore = 45;
-    if (pattern) baseScore = Math.round(pattern.success * 0.65 + Math.min(100, pattern.cases * 3) * 0.20 + Math.min(100, Math.abs(redP - blackP) * 4) * 0.15);
+    if (legacyPattern) baseScore = Math.round(legacyPattern.success * 0.65 + Math.min(100, legacyPattern.cases * 3) * 0.20 + Math.min(100, Math.abs(redP - blackP) * 4) * 0.15);
     if (streak.count >= 3) baseScore = Math.min(96, baseScore + 5);
 
-    // O novo sensor representa 20% do score. Não há corte novo de sinais nesta versão.
+    // Um padrão recorrente forte pode mudar o alvo apenas com suporte e vantagem claros.
+    const activePattern = recurringPatterns.active;
+    const targetPattern = recurringPatterns.bestByTarget?.[target];
+    const opposite = target === "red" ? "black" : "red";
+    const oppositePattern = recurringPatterns.bestByTarget?.[opposite];
+    if (activePattern?.qualified && activePattern.target !== target && activePattern.cases >= 15 &&
+        activePattern.successG1 >= 68 && activePattern.strength >= (targetPattern?.strength || 0) + 8) {
+      target = activePattern.target;
+    }
+
     const similarity = this.similaritySensor(rounds, target);
-    const score = Math.max(0, Math.min(99, Math.round(baseScore * 0.80 + similarity.score * 0.20)));
-    const grade = score >= 78 ? "FORTE" : score >= 62 ? "ATENÇÃO" : score < 45 ? "EVITAR" : "NEUTRO";
+    const selectedPattern = recurringPatterns.bestByTarget?.[target];
+    const patternScore = selectedPattern ? selectedPattern.strength : 50;
+    // Preserva a leitura anterior e adiciona padrões como confirmação, não como gatilho isolado.
+    let score = Math.round(baseScore * 0.65 + similarity.score * 0.15 + patternScore * 0.20);
+    if (selectedPattern?.qualified) score += Math.min(5, Math.max(1, Math.round((selectedPattern.successG1 - 65) / 4)));
+    score = Math.max(0, Math.min(99, score));
+    const grade = score >= 84 ? "FORTE" : score >= 72 ? "ATENÇÃO" : score < 45 ? "EVITAR" : "NEUTRO";
     return {
       target, score, baseScore, grade, similarity,
-      pattern: pattern ? pattern.pattern.map(c => c === "red" ? "V" : "P").join(" • ") : "LEITURA DINÂMICA",
+      patternOpportunity: selectedPattern,
+      patternSensor: { active: recurringPatterns.active, qualified: recurringPatterns.qualified },
+      pattern: legacyPattern ? legacyPattern.pattern.map(c => c === "red" ? "V" : "P").join(" • ") : "LEITURA DINÂMICA",
       anchorKey: roundKey(latest), anchorAt: latest.createdAt
     };
   }
