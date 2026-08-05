@@ -149,17 +149,22 @@ class SigmaWhiteEngine {
     }
   }
   sensorWeights() {
-    // Calibração experimental solicitada para o WHITE V2.1.
-    // Os pesos ficam fixos durante este teste; o aprendizado contínuo segue
-    // registrando desempenho dos sensores, sem alterar esta distribuição.
+    // Índice único de força (0 a 10). A similaridade atua apenas como bônus
+    // pequeno e nunca funciona como trava isolada.
     return {
-      gap: 0.32,
-      pressure: 0.22,
-      density: 0.15,
-      dispersion: 0.10,
-      minute: 0.10,
-      similarity: 0.11
+      gap: 3.0,
+      pressure: 2.5,
+      density: 1.8,
+      dispersion: 1.2,
+      minute: 1.0,
+      similarity: 0.5
     };
+  }
+  minimumForce() { return 6.2; }
+  signalTier(force) {
+    if (force >= 8.5) return "ELITE";
+    if (force >= 7.4) return "FORTE";
+    return "NORMAL";
   }
   patternSimilarity(rounds, aEnd, bEnd, length) {
     let score = 0;
@@ -215,7 +220,7 @@ class SigmaWhiteEngine {
     return { probability: clamp(probability, 0.05, 0.92), matches: top.length, confidence: clamp(top.length / 45, 0, 1), agreement };
   }
   updateLearning(operation) {
-    const y = operation.status === "WIN" ? 1 : 0;
+    const y = Number(operation.whitesCaptured || 0) > 0 ? 1 : 0;
     const components = operation.components || {};
     Object.entries(this.learning.sensors).forEach(([key, sensor]) => {
       const p = clamp(Number(components[key]?.probability ?? components[key] ?? 0.5), 0.02, 0.98);
@@ -283,7 +288,7 @@ class SigmaWhiteEngine {
     };
   }
   state() {
-    const wins = this.history.filter(x => x.status === "WIN").length;
+    const wins = this.history.filter(x => Number(x.whitesCaptured || 0) > 0).length;
     return {
       enabled: this.enabled,
       mode: "SERVER_24H",
@@ -325,21 +330,7 @@ class SigmaWhiteEngine {
   normalizeSensor(value, min, max) {
     return clamp((Number(value) - min) / Math.max(0.0001, max - min), 0, 1);
   }
-  calibrateScore(rawStrength) {
-    const points = [[0,30],[20,42],[40,55],[50,64],[60,72],[70,80],[80,88],[90,94],[100,98]];
-    const x = clamp(Number(rawStrength) || 0, 0, 100);
-    for (let i = 1; i < points.length; i += 1) {
-      const [x1, y1] = points[i - 1];
-      const [x2, y2] = points[i];
-      if (x <= x2) return Math.round(y1 + ((x - x1) / (x2 - x1)) * (y2 - y1));
-    }
-    return 98;
-  }
-  signalTier(score) {
-    if (score >= 93) return "ELITE";
-    if (score >= 85) return "FORTE";
-    return "NORMAL";
-  }
+
 
   projectNextWhite() {
     const rounds = this.chronologicalRounds();
@@ -414,51 +405,52 @@ class SigmaWhiteEngine {
       Object.entries(normalized).forEach(([key, strength]) => {
         components[key].strength = Number((strength * 100).toFixed(1));
       });
-      const consensusVotes = Object.values(normalized).filter(v => v >= 0.55).length;
-      const rawStrength = (
+      const favorableSensors = Object.values(normalized).filter(v => v >= 0.55).length;
+      const force = (
         normalized.gap * weights.gap +
         normalized.pressure * weights.pressure +
         normalized.density * weights.density +
         normalized.dispersion * weights.dispersion +
         normalized.minute * weights.minute +
         normalized.similarity * weights.similarity
-      ) * 100;
-      const score = this.calibrateScore(rawStrength);
-      const probability = clamp(score / 100, 0.30, 0.98);
+      );
+      const probability = clamp(force / 10, 0.05, 0.98);
 
       const targetMs = target.getTime();
       const candidate = {
-        id: `server-white-v2-${targetMs}`,
-        engineVersion: "WHITE_V2_3_SCORE_NORMALIZADO_TELEMETRIA",
-        targetAt: target.toISOString(), createdAt: new Date().toISOString(), score, rawScore: Number(rawStrength.toFixed(1)),
-        signalTier: this.signalTier(score), probability: Number(probability.toFixed(4)), expectedGap: Math.round(expected), sinceAtProjection: since,
-        status: "WAITING", classification: score >= 72 && consensusVotes >= 3 ? "ACTIVE" : "OBSERVATION",
+        id: `server-white-v3-${targetMs}`,
+        engineVersion: "BRANCO_V3_FORCA_0_A_10_MULTI_WHITE",
+        targetAt: target.toISOString(), createdAt: new Date().toISOString(),
+        force: Number(force.toFixed(2)), score: Math.round(force * 10),
+        signalTier: this.signalTier(force), probability: Number(probability.toFixed(4)), expectedGap: Math.round(expected), sinceAtProjection: since,
+        status: "WAITING", classification: force >= this.minimumForce() ? "ACTIVE" : "OBSERVATION",
         windowStartAt: new Date(targetMs - 60000).toISOString(),
         windowEndAt: new Date(targetMs + 120000).toISOString(), processedHouses: 0,
         sampleQuality: gaps.length >= 40 ? "FULL" : gaps.length >= 12 ? "MODERATE" : "LOW",
-        intervalsUsed: gaps.length, consensusVotes, components, sensorWeights: weights,
+        intervalsUsed: gaps.length, favorableSensors, components, sensorWeights: weights,
         reasons: [
-          `Similaridade: ${similarity.matches} cenários; chance histórica ${(similarityProbability * 100).toFixed(0)}%.`,
-          `Consenso: ${consensusVotes}/6 sensores favoráveis (mínimo 3).`,
+          `Similaridade: ${similarity.matches} cenários; chance histórica ${(similarityProbability * 100).toFixed(0)}% (bônus máximo 0,5).`,
+          `Força dos sensores: ${force.toFixed(2)}/10,0 (mínimo ${this.minimumForce().toFixed(1)}).`,
           `Intervalo projetado ${projectedGap}; referência ${Math.round(expected)}.`,
           `Pressão estatística: percentil ${(pressurePercentile * 100).toFixed(0)}%.`,
           `Minuto ${String(localMinute).padStart(2, "0")}: taxa ajustada ${(minuteProbability * 100).toFixed(0)}%.`,
-          `Score-base normalizado: ${rawStrength.toFixed(1)}; calibrado: ${score}.`,
+          `Sensores favoráveis: ${favorableSensors}/6; decisão feita apenas pela força ponderada.`,
           `Aprendizado contínuo: ${this.learning.operations || 0} operações avaliadas.`
         ]
       };
-      if (!best || candidate.score > best.score || (candidate.score === best.score && targetMs < new Date(best.targetAt).getTime())) best = candidate;
+      if (!best || candidate.force > best.force || (candidate.force === best.force && targetMs < new Date(best.targetAt).getTime())) best = candidate;
     }
     this.whiteDebug = {
       evaluated,
       bestScore: best?.score ?? null,
-      bestVotes: best?.consensusVotes ?? null,
+      bestForce: best?.force ?? null,
+      bestVotes: best?.favorableSensors ?? null,
       bestTargetAt: best?.targetAt ?? null,
       bestClassification: best?.classification ?? null,
       lastEvaluationAt: new Date().toISOString(),
       status: best ? (best.classification === "ACTIVE" ? "SIGNAL_READY" : "OBSERVING") : "NO_CANDIDATE",
-      minimumScore: 72,
-      rule: "Score 72+ e mínimo 3/6 sensores"
+      minimumForce: this.minimumForce(),
+      rule: `Força ${this.minimumForce().toFixed(1)}+ em escala de 0 a 10`
     };
     // Mantém sempre o melhor candidato visível em observação, mesmo com score baixo.
     // A publicação no Telegram continua restrita às regras de score e consenso.
@@ -481,6 +473,7 @@ class SigmaWhiteEngine {
     // já publicada nunca é substituída.
     this.active = candidate;
     if (candidate.classification === "ACTIVE") await this.sendSignal(candidate);
+    else this.beginObservationTracking(candidate);
     this.emitState();
   }
   async handleRound(round) {
@@ -498,7 +491,7 @@ class SigmaWhiteEngine {
       const candidateIsActive = candidate?.classification === "ACTIVE";
       const shouldReplace = candidate && Date.now() < start && (
         !currentWasActive ||
-        candidate.score >= this.active.score + 3 ||
+        candidate.force >= this.active.force + 0.30 ||
         (candidateIsActive && !currentWasActive)
       );
       if (shouldReplace) {
@@ -515,20 +508,17 @@ class SigmaWhiteEngine {
       await this.ensureProjection();
       return;
     }
-    if (time >= end) {
-      // A janela terminou. Mesmo que alguma rodada tenha sido perdida pelo stream,
-      // a operação precisa ser encerrada para nunca ficar travada em 4/6 ou 5/6.
-      await this.settle("LOSS", "LOSS", null, round);
-      return;
-    }
     this.active.status = "IN_OPERATION";
     this.active.processedHouses = Math.min(6, (this.active.processedHouses || 0) + 1);
+    if (!Array.isArray(this.active.whiteHouses)) this.active.whiteHouses = [];
     if (normalizeColor(round) === "white") {
-      await this.settle("WIN", `WIN CASA ${this.active.processedHouses}`, this.active.processedHouses, round);
-      return;
+      this.active.whiteHouses.push(this.active.processedHouses);
+      this.active.whiteHouses = [...new Set(this.active.whiteHouses)].sort((a, b) => a - b);
+      this.active.whitesCaptured = this.active.whiteHouses.length;
     }
     if (this.active.processedHouses >= 6) {
-      await this.settle("LOSS", "LOSS", null, round);
+      const count = this.active.whiteHouses.length;
+      await this.settle(count ? "WIN" : "LOSS", count ? this.classifyWhiteResult(this.active.whiteHouses) : "LOSS", this.active.whiteHouses[0] || null, round);
       return;
     }
     this.emitState();
@@ -536,10 +526,10 @@ class SigmaWhiteEngine {
   beginObservationTracking(candidate) {
     if (!candidate || this.observationTracking.some(x => x.id === candidate.id)) return;
     this.observationTracking.unshift({
-      ...candidate, status: "OBSERVING_RESULT", processedHouses: 0,
+      ...candidate, status: "OBSERVING_RESULT", processedHouses: 0, whiteHouses: [], whitesCaptured: 0,
       observationStartedAt: new Date().toISOString()
     });
-    this.observationTracking = this.observationTracking.slice(0, 12);
+    this.observationTracking = this.observationTracking.slice(0, 120);
   }
   async processObservationRound(round, timeMs) {
     if (!this.observationTracking.length) return;
@@ -549,12 +539,28 @@ class SigmaWhiteEngine {
       const start = new Date(obs.windowStartAt).getTime();
       const end = new Date(obs.windowEndAt).getTime();
       if (!Number.isFinite(start) || !Number.isFinite(end) || timeMs < start) continue;
-      if (timeMs >= end) { finished.push({ ...obs, status: "LOSS", result: "LOSS", resolvedAt: roundTime(round) }); continue; }
+      if (timeMs > end + 30000 && (obs.processedHouses || 0) < 6) {
+        const count = Array.isArray(obs.whiteHouses) ? obs.whiteHouses.length : 0;
+        finished.push({ ...obs, status: count ? "WIN" : "LOSS", result: count ? this.classifyWhiteResult(obs.whiteHouses) : "LOSS", whiteHouses: obs.whiteHouses || [], whitesCaptured: count, resolvedAt: roundTime(round) });
+        continue;
+      }
       obs.processedHouses = Math.min(6, (obs.processedHouses || 0) + 1);
+      if (!Array.isArray(obs.whiteHouses)) obs.whiteHouses = [];
       if (color === "white") {
-        finished.push({ ...obs, status: "WIN", result: `WIN CASA ${obs.processedHouses}`, house: obs.processedHouses, resolvedAt: roundTime(round) });
-      } else if (obs.processedHouses >= 6) {
-        finished.push({ ...obs, status: "LOSS", result: "LOSS", resolvedAt: roundTime(round) });
+        obs.whiteHouses.push(obs.processedHouses);
+        obs.whiteHouses = [...new Set(obs.whiteHouses)].sort((a, b) => a - b);
+      }
+      if (obs.processedHouses >= 6) {
+        const count = obs.whiteHouses.length;
+        finished.push({
+          ...obs,
+          status: count ? "WIN" : "LOSS",
+          result: count ? this.classifyWhiteResult(obs.whiteHouses) : "LOSS",
+          house: obs.whiteHouses[0] || null,
+          whiteHouses: obs.whiteHouses,
+          whitesCaptured: count,
+          resolvedAt: roundTime(round)
+        });
       }
     }
     if (finished.length) {
@@ -566,14 +572,32 @@ class SigmaWhiteEngine {
     }
   }
 
+  classifyWhiteResult(houses) {
+    const list = [...new Set((houses || []).map(Number).filter(n => n >= 1 && n <= 6))].sort((a, b) => a - b);
+    if (!list.length) return "LOSS";
+    if (list.length === 1) return `BRANCO PAGO • CASA ${list[0]}`;
+    if (list.length === 2) {
+      const distance = list[1] - list[0];
+      if (distance === 1) return "BRANCO PAGO • DUPLO";
+      if (distance === 2) return "BRANCO PAGO • ESPELHADO";
+      if (distance === 3) return "BRANCO PAGO • DENTADO";
+      if (distance === 4) return "BRANCO PAGO • BANGUELO";
+      return "BRANCO PAGO • 2 BRANCOS NA OPERAÇÃO";
+    }
+    const consecutive = list.every((value, index) => index === 0 || value === list[index - 1] + 1);
+    if (list.length === 3 && consecutive) return "BRANCO PAGO • TRIPLO";
+    return `BRANCO PAGO • ${list.length} BRANCOS NA OPERAÇÃO`;
+  }
+
   async settle(status, result, house, round) {
     if (!this.active || this.settling) return;
     this.settling = true;
-    const finished = { ...this.active, status, result, house, resolvedAt: roundTime(round) };
+    const whiteHouses = Array.isArray(this.active.whiteHouses) ? [...this.active.whiteHouses] : [];
+    const finished = { ...this.active, status, result, house, whiteHouses, whitesCaptured: whiteHouses.length, resolvedAt: roundTime(round) };
     this.history.unshift(finished);
     this.history = this.history.slice(0, 20);
     this.saveHistoryState();
-    if (finished.classification === "ACTIVE" || finished.score >= 72) {
+    if (finished.classification === "ACTIVE" || Number(finished.force) >= this.minimumForce()) {
       this.operationArchive.unshift(finished);
       this.operationArchive = this.operationArchive.slice(0, 2500);
       this.updateLearning(finished);
@@ -621,22 +645,37 @@ class SigmaWhiteEngine {
       const t = new Date(op.resolvedAt || op.createdAt).getTime();
       return Number.isFinite(t) && t >= start.getTime() && t < end.getTime();
     });
-    const wins = operations.filter(op => op.status === "WIN");
-    const losses = operations.filter(op => op.status === "LOSS");
-    const whites = this.chronologicalRounds().filter(round => {
+    const losses = operations.filter(op => Number(op.whitesCaptured || 0) === 0);
+    const capturedWhites = operations.reduce((sum, op) => sum + Number(op.whitesCaptured || 0), 0);
+    const payingOperations = operations.filter(op => Number(op.whitesCaptured || 0) > 0);
+    const realWhites = this.chronologicalRounds().filter(round => {
       const t = new Date(round.createdAt).getTime();
       return round.color === "white" && Number.isFinite(t) && t >= start.getTime() && t < end.getTime();
     }).length;
-    const houses = Array.from({ length: 6 }, (_, i) => wins.filter(op => Number(op.house) === i + 1).length);
-    const accuracy = operations.length ? (wins.length / operations.length) * 100 : 0;
+    const houseCaptures = Array.from({ length: 6 }, (_, i) => operations.filter(op => (op.whiteHouses || []).includes(i + 1)).length);
+    const captureRate = operations.length ? capturedWhites / operations.length : 0;
+    const coverage = realWhites ? capturedWhites / realWhites * 100 : 0;
     const observations = this.observationArchive.filter(op => {
       const t = new Date(op.resolvedAt || op.createdAt).getTime();
       return Number.isFinite(t) && t >= start.getTime() && t < end.getTime();
     });
-    const observationWins = observations.filter(op => op.status === "WIN");
-    const observationLosses = observations.filter(op => op.status === "LOSS");
-    const observationAccuracy = observations.length ? observationWins.length / observations.length * 100 : 0;
-    return { signals: operations.length, wins: wins.length, losses: losses.length, whites, houses, accuracy, observations, observationWins, observationLosses, observationAccuracy };
+    const observationWhites = observations.reduce((sum, op) => sum + Number(op.whitesCaptured || 0), 0);
+    const observationPaying = observations.filter(op => Number(op.whitesCaptured || 0) > 0);
+    const observationLosses = observations.filter(op => Number(op.whitesCaptured || 0) === 0);
+    return {
+      signals: operations.length,
+      payingOperations: payingOperations.length,
+      losses: losses.length,
+      capturedWhites,
+      realWhites,
+      houseCaptures,
+      captureRate,
+      coverage,
+      observations,
+      observationWhites,
+      observationPaying,
+      observationLosses
+    };
   }
   async sendHourlySummary(now = new Date()) {
     const p = this.saoPauloParts(now);
@@ -645,39 +684,82 @@ class SigmaWhiteEngine {
     const stats = this.periodStats(start, end);
     const startLabel = fmtTime(start);
     const endLabel = fmtTime(new Date(end.getTime() - 1000));
-    const houseLine = stats.wins ? `\n🏠 Casas: C1 ${stats.houses[0]} • C2 ${stats.houses[1]} • C3 ${stats.houses[2]} • C4 ${stats.houses[3]} • C5 ${stats.houses[4]} • C6 ${stats.houses[5]}` : "";
-    await this.sendTelegram(`📊 SIGMA WHITE • RESUMO DA HORA\n\n🕒 Período: ${startLabel} às ${endLabel}\n📡 Sinais finalizados: ${stats.signals}\n✅ Wins: ${stats.wins}\n❌ Loss: ${stats.losses}\n⚪ Brancos no período: ${stats.whites}${houseLine}\n🎯 Assertividade: ${stats.accuracy.toFixed(1).replace(".", ",")}%`);
+    const houseLine = stats.capturedWhites ? `
+🏠 Capturas: C1 ${stats.houseCaptures[0]} • C2 ${stats.houseCaptures[1]} • C3 ${stats.houseCaptures[2]} • C4 ${stats.houseCaptures[3]} • C5 ${stats.houseCaptures[4]} • C6 ${stats.houseCaptures[5]}` : "";
+    await this.sendTelegram(`📊 SIGMA ⚪ BRANCO • RESUMO DA HORA
+
+🕒 Período: ${startLabel} às ${endLabel}
+📡 Operações finalizadas: ${stats.signals}
+⚪ Brancos capturados: ${stats.capturedWhites}
+✅ Operações com branco: ${stats.payingOperations}
+❌ Operações sem branco: ${stats.losses}
+⚪ Brancos reais no período: ${stats.realWhites}${houseLine}
+🎯 Média: ${stats.captureRate.toFixed(2).replace(".", ",")} branco/operação
+📈 Cobertura dos brancos do período: ${stats.coverage.toFixed(1).replace(".", ",")}%`);
   }
-  scoreBucket(score) {
-    if (score >= 93) return "93+";
-    if (score >= 90) return "90-92";
-    if (score >= 85) return "85-89";
-    if (score >= 80) return "80-84";
-    if (score >= 72) return "72-79";
-    if (score >= 60) return "60-71";
-    if (score >= 50) return "50-59";
-    return "<50";
+  forceBucket(force) {
+    if (force >= 8.5) return "8,5+";
+    if (force >= 7.4) return "7,4-8,4";
+    if (force >= 6.2) return "6,2-7,3";
+    if (force >= 5.0) return "5,0-6,1";
+    if (force >= 4.0) return "4,0-4,9";
+    return "<4,0";
   }
   async sendDailySummary(now = new Date()) {
     const p = this.saoPauloParts(now);
     const start = this.localBoundaryToUtc({ year: p.year, month: p.month, day: p.day, hour: 0, minute: 0 });
     const end = new Date(now.getTime() + 1000);
     const stats = this.periodStats(start, end);
-    const houseLine = stats.wins ? `\n🏠 Casas: C1 ${stats.houses[0]} • C2 ${stats.houses[1]} • C3 ${stats.houses[2]} • C4 ${stats.houses[3]} • C5 ${stats.houses[4]} • C6 ${stats.houses[5]}` : "";
-    const all = [...stats.observations, ...this.operationArchive.filter(op => { const t = new Date(op.resolvedAt || op.createdAt).getTime(); return Number.isFinite(t) && t >= start.getTime() && t < end.getTime(); })];
-    const buckets = { "93+":0, "90-92":0, "85-89":0, "80-84":0, "72-79":0, "60-71":0, "50-59":0, "<50":0 };
-    all.forEach(x => { buckets[this.scoreBucket(Number(x.score) || 0)] += 1; });
-    const published = all.filter(x => x.classification === "ACTIVE" || Number(x.score) >= 72);
-    const avg = items => items.length ? items.reduce((a,b) => a + (Number(b.score)||0),0) / items.length : 0;
-    const winOps = published.filter(x => x.status === "WIN");
-    const lossOps = published.filter(x => x.status === "LOSS");
-    const sensorNames = { gap:"Intervalo", pressure:"Pressão", density:"Densidade", dispersion:"Dispersão", minute:"Minuto", similarity:"Similaridade" };
-    const sensorStats = {};
-    Object.keys(sensorNames).forEach(key => {
-      const vals = all.map(x => Number(x.components?.[key]?.strength)).filter(Number.isFinite);
-      sensorStats[key] = vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : 0;
+    const operations = this.operationArchive.filter(op => {
+      const t = new Date(op.resolvedAt || op.createdAt).getTime();
+      return Number.isFinite(t) && t >= start.getTime() && t < end.getTime();
     });
-    const text = `📈 SIGMA WHITE • FECHAMENTO DO DIA\n\n📅 Data: ${p.day}/${p.month}/${p.year}\n📡 Sinais finalizados: ${stats.signals}\n✅ Wins: ${stats.wins}\n❌ Loss: ${stats.losses}\n⚪ Brancos no dia: ${stats.whites}${houseLine}\n🎯 Assertividade: ${stats.accuracy.toFixed(1).replace(".", ",")}%\n\n🧠 DIAGNÓSTICO TÉCNICO\n👀 Observações avaliadas: ${stats.observations.length}\n⚪ Observações que pagariam: ${stats.observationWins.length}\n❌ Observações que falhariam: ${stats.observationLosses.length}\n📊 Acerto das observações: ${stats.observationAccuracy.toFixed(1).replace(".", ",")}%\n\n📚 Scores: 93+ ${buckets["93+"]} • 90-92 ${buckets["90-92"]} • 85-89 ${buckets["85-89"]} • 80-84 ${buckets["80-84"]} • 72-79 ${buckets["72-79"]} • 60-71 ${buckets["60-71"]} • 50-59 ${buckets["50-59"]} • <50 ${buckets["<50"]}\n\n📐 Score médio WIN: ${avg(winOps).toFixed(1).replace(".", ",")}\n📐 Score médio LOSS: ${avg(lossOps).toFixed(1).replace(".", ",")}\n📈 Maior score: ${all.length ? Math.max(...all.map(x=>Number(x.score)||0)) : 0}\n📉 Menor score publicado: ${published.length ? Math.min(...published.map(x=>Number(x.score)||0)) : 0}\n\n🧩 Força média dos sensores\n${Object.entries(sensorNames).map(([k,n]) => `${n}: ${sensorStats[k].toFixed(1).replace(".", ",")}%`).join("\n")}`;
+    const all = [...stats.observations, ...operations];
+    const buckets = { "8,5+":0, "7,4-8,4":0, "6,2-7,3":0, "5,0-6,1":0, "4,0-4,9":0, "<4,0":0 };
+    all.forEach(x => { buckets[this.forceBucket(Number(x.force) || 0)] += 1; });
+    const avgForce = items => items.length ? items.reduce((a,b) => a + (Number(b.force)||0),0) / items.length : 0;
+    const paying = operations.filter(x => Number(x.whitesCaptured || 0) > 0);
+    const losses = operations.filter(x => Number(x.whitesCaptured || 0) === 0);
+    const sensorNames = { gap:"Intervalo", pressure:"Pressão", density:"Densidade", dispersion:"Dispersão", minute:"Minuto", similarity:"Similaridade" };
+    const sensorLine = group => Object.entries(sensorNames).map(([k,n]) => {
+      const vals = group.map(x => Number(x.components?.[k]?.strength)).filter(Number.isFinite);
+      return `${n}: ${vals.length ? (vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(1).replace(".", ",") : "0,0"}%`;
+    }).join("\n");
+    const patterns = {};
+    operations.filter(x => x.whitesCaptured > 1).forEach(x => { patterns[x.result] = (patterns[x.result] || 0) + 1; });
+    const patternText = Object.keys(patterns).length ? Object.entries(patterns).map(([k,v]) => `${k.replace("BRANCO PAGO • ", "")}: ${v}`).join(" • ") : "Nenhum múltiplo";
+    const text = `📈 SIGMA ⚪ BRANCO • FECHAMENTO DO DIA
+
+📅 Data: ${p.day}/${p.month}/${p.year}
+📡 Operações finalizadas: ${stats.signals}
+⚪ Brancos capturados nas operações: ${stats.capturedWhites}
+✅ Operações com pelo menos 1 branco: ${stats.payingOperations}
+❌ Operações sem branco: ${stats.losses}
+⚪ Brancos reais no dia: ${stats.realWhites}
+🎯 Média: ${stats.captureRate.toFixed(2).replace(".", ",")} branco/operação
+📈 Cobertura dos brancos do dia: ${stats.coverage.toFixed(1).replace(".", ",")}%
+🏠 Capturas: C1 ${stats.houseCaptures[0]} • C2 ${stats.houseCaptures[1]} • C3 ${stats.houseCaptures[2]} • C4 ${stats.houseCaptures[3]} • C5 ${stats.houseCaptures[4]} • C6 ${stats.houseCaptures[5]}
+🧬 Múltiplos: ${patternText}
+
+🧠 DIAGNÓSTICO TÉCNICO
+👀 Observações concluídas: ${stats.observations.length}
+⚪ Brancos que seriam capturados nas observações: ${stats.observationWhites}
+✅ Observações com branco: ${stats.observationPaying.length}
+❌ Observações sem branco: ${stats.observationLosses.length}
+🎯 Média nas observações: ${stats.observations.length ? (stats.observationWhites/stats.observations.length).toFixed(2).replace(".", ",") : "0,00"} branco/observação
+
+📚 Força: 8,5+ ${buckets["8,5+"]} • 7,4-8,4 ${buckets["7,4-8,4"]} • 6,2-7,3 ${buckets["6,2-7,3"]} • 5,0-6,1 ${buckets["5,0-6,1"]} • 4,0-4,9 ${buckets["4,0-4,9"]} • <4,0 ${buckets["<4,0"]}
+
+⚡ Força média com branco: ${avgForce(paying).toFixed(2).replace(".", ",")}
+⚡ Força média sem branco: ${avgForce(losses).toFixed(2).replace(".", ",")}
+📈 Maior força: ${all.length ? Math.max(...all.map(x=>Number(x.force)||0)).toFixed(2).replace(".", ",") : "0,00"}
+📉 Menor força publicada: ${operations.length ? Math.min(...operations.map(x=>Number(x.force)||0)).toFixed(2).replace(".", ",") : "0,00"}
+
+🧩 Sensores médios — operações com branco
+${sensorLine(paying)}
+
+🧩 Sensores médios — operações sem branco
+${sensorLine(losses)}`;
     await this.sendTelegram(text);
   }
   async checkScheduledSummaries() {
@@ -721,7 +803,8 @@ class SigmaWhiteEngine {
       roll: null,
       color: null
     };
-    await this.settle("LOSS", "LOSS", null, syntheticRound);
+    const count = Array.isArray(this.active.whiteHouses) ? this.active.whiteHouses.length : 0;
+    await this.settle(count ? "WIN" : "LOSS", count ? this.classifyWhiteResult(this.active.whiteHouses) : "LOSS", this.active.whiteHouses?.[0] || null, syntheticRound);
   }
   async sendTelegram(text) {
     if (!this.telegramToken || !this.telegramChatId) return null;
@@ -736,17 +819,38 @@ class SigmaWhiteEngine {
   async sendSignal(operation) {
     if (operation.telegramSignalSent) return;
     operation.telegramSignalSent = true;
-    const tier = operation.signalTier || this.signalTier(operation.score);
-    const header = tier === "ELITE" ? "👑 SIGMA WHITE • SINAL ELITE" : tier === "FORTE" ? "🔥 SIGMA WHITE • SINAL FORTE" : "Σ SIGMA LEITURA • WHITE";
-    const badge = tier === "ELITE" ? "\n🚨 CENÁRIO RARÍSSIMO • 90+" : tier === "FORTE" ? "\n💪 CONFIANÇA ELEVADA" : "";
+    operation.whiteHouses = [];
+    operation.whitesCaptured = 0;
+    const tier = operation.signalTier || this.signalTier(operation.force || 0);
+    const header = tier === "ELITE" ? "👑 SIGMA BRANCO • SINAL ELITE" : tier === "FORTE" ? "🔥 SIGMA BRANCO • SINAL FORTE" : "Σ SIGMA LEITURA • ⚪ BRANCO";
+    const badge = tier === "ELITE" ? "\n🚨 CENÁRIO RARÍSSIMO" : tier === "FORTE" ? "\n💪 FORÇA ELEVADA" : "";
     const strengths = Object.entries(operation.components || {}).sort((a,b)=>(b[1].strength||0)-(a[1].strength||0)).slice(0,3).map(([k,v]) => `✔ ${({gap:"Intervalo",pressure:"Pressão",density:"Densidade",dispersion:"Dispersão",minute:"Minuto",similarity:"Similaridade"})[k]} ${Number(v.strength||0).toFixed(0)}%`).join("\n");
-    await this.sendTelegram(`${header}\n\n⚪ BRANCO PROJETADO\n\n⏰ Horário central: ${fmtTime(operation.targetAt)}\n🕒 Janela: ${fmtTime(operation.windowStartAt)} até ${fmtTime(new Date(new Date(operation.targetAt).getTime() + 60000))}\n🎯 Margem: 6 casas\n📊 Score: ${operation.score} (base ${operation.rawScore ?? "—"})${badge}${strengths ? `\n\n${strengths}` : ""}`);
+    await this.sendTelegram(`${header}
+
+⚪ BRANCO PROJETADO
+
+⏰ Horário central: ${fmtTime(operation.targetAt)}
+🕒 Janela: ${fmtTime(operation.windowStartAt)} até ${fmtTime(new Date(new Date(operation.targetAt).getTime() + 60000))}
+🎯 Margem: 6 casas
+⚡ Força: ${Number(operation.force || 0).toFixed(2).replace(".", ",")} / 10,0${badge}${strengths ? `
+
+${strengths}` : ""}`);
   }
   async sendResult(operation) {
-    const text = operation.status === "WIN"
-      ? `✅ WHITE PAGO • CASA ${operation.house}\n\n⏰ Projeção: ${fmtTime(operation.targetAt)}\n📊 Score: ${operation.score}`
-      : `❌ WHITE LOSS\n\n⏰ Projeção: ${fmtTime(operation.targetAt)}\n📊 Score: ${operation.score}`;
-    await this.sendTelegram(text);
+    if (operation.status === "WIN") {
+      const houses = (operation.whiteHouses || []).map(h => `C${h}`).join(" • ");
+      await this.sendTelegram(`✅⚪️ ${operation.result}
+
+🏠 Casas: ${houses || "—"}
+⚪ Brancos capturados: ${operation.whitesCaptured || 0}
+⏰ Projeção: ${fmtTime(operation.targetAt)}
+⚡ Força: ${Number(operation.force || 0).toFixed(2).replace(".", ",")} / 10,0`);
+      return;
+    }
+    await this.sendTelegram(`❌ ⚪ BRANCO NÃO OCORREU
+
+⏰ Projeção: ${fmtTime(operation.targetAt)}
+⚡ Força: ${Number(operation.force || 0).toFixed(2).replace(".", ",")} / 10,0`);
   }
   emitState() { this.broadcast("white-reading", this.state()); }
 }
