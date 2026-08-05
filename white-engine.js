@@ -438,6 +438,35 @@ class SigmaWhiteEngine {
     return clamp((Number(value) - min) / Math.max(0.0001, max - min), 0, 1);
   }
 
+  // Curva de força recalibrada: mantém leituras fracas baixas, mas permite que
+  // sensores realmente favoráveis utilizem quase todo o peso disponível.
+  calibratedSensorStrength(rawStrength) {
+    const x = clamp(Number(rawStrength) || 0, 0, 1);
+    const points = [
+      [0.00, 0.00], [0.20, 0.08], [0.35, 0.25], [0.45, 0.42],
+      [0.55, 0.60], [0.65, 0.72], [0.75, 0.82], [0.85, 0.91],
+      [0.95, 0.98], [1.00, 1.00]
+    ];
+    for (let i = 1; i < points.length; i += 1) {
+      const [x1, y1] = points[i - 1];
+      const [x2, y2] = points[i];
+      if (x <= x2) {
+        const t = (x - x1) / Math.max(0.0001, x2 - x1);
+        return clamp(y1 + (y2 - y1) * t, 0, 1);
+      }
+    }
+    return 1;
+  }
+
+  alignmentBonus(strengths) {
+    const strong = Object.values(strengths).filter(v => Number(v) >= 0.60).length;
+    if (strong >= 6) return 1.00;
+    if (strong >= 5) return 0.75;
+    if (strong >= 4) return 0.50;
+    if (strong >= 3) return 0.25;
+    return 0;
+  }
+
 
   projectNextWhite() {
     const rounds = this.chronologicalRounds();
@@ -510,7 +539,7 @@ class SigmaWhiteEngine {
           contribution: Number((recurringPattern.strength * weights.patterns).toFixed(3))
         }
       };
-      const normalized = {
+      const rawNormalized = {
         gap: this.normalizeSensor(gapProbability, 0.06, 0.84),
         pressure: this.normalizeSensor(pressureProbability, 0.10, 0.78),
         density: this.normalizeSensor(densityProbability, 0.10, 0.68),
@@ -519,11 +548,14 @@ class SigmaWhiteEngine {
         similarity: this.normalizeSensor(similarityProbability, 0.05, 0.92),
         patterns: recurringPattern.strength
       };
+      const normalized = Object.fromEntries(
+        Object.entries(rawNormalized).map(([key, value]) => [key, this.calibratedSensorStrength(value)])
+      );
       Object.entries(normalized).forEach(([key, strength]) => {
         components[key].strength = Number((strength * 100).toFixed(1));
       });
-      const favorableSensors = Object.values(normalized).filter(v => v >= 0.55).length;
-      const force = (
+      const favorableSensors = Object.values(normalized).filter(v => v >= 0.60).length;
+      const baseForce = (
         normalized.gap * weights.gap +
         normalized.pressure * weights.pressure +
         normalized.density * weights.density +
@@ -532,13 +564,16 @@ class SigmaWhiteEngine {
         normalized.similarity * weights.similarity +
         normalized.patterns * weights.patterns
       );
+      const alignmentBonus = this.alignmentBonus(normalized);
+      const force = clamp(baseForce + alignmentBonus, 0, 10);
       const contributions = Object.fromEntries(Object.keys(weights).map(key => [key, Number((normalized[key] * weights[key]).toFixed(3))]));
+      contributions.alignment = Number(alignmentBonus.toFixed(2));
       const probability = clamp(force / 10, 0.05, 0.98);
 
       const targetMs = target.getTime();
       const candidate = {
         id: `server-white-v3-${targetMs}`,
-        engineVersion: "BRANCO_V6_PADROES_CATALOGO_INTEGRADO",
+        engineVersion: "BRANCO_V6_FORCA_RECALIBRADA",
         targetAt: target.toISOString(), createdAt: new Date().toISOString(),
         force: Number(force.toFixed(2)), score: Math.round(force * 10),
         signalTier: this.signalTier(force), probability: Number(probability.toFixed(4)), expectedGap: Math.round(expected), sinceAtProjection: since,
@@ -546,11 +581,11 @@ class SigmaWhiteEngine {
         windowStartAt: new Date(targetMs - 60000).toISOString(),
         windowEndAt: new Date(targetMs + 120000).toISOString(), processedHouses: 0,
         sampleQuality: gaps.length >= 40 ? "FULL" : gaps.length >= 12 ? "MODERATE" : "LOW",
-        intervalsUsed: gaps.length, favorableSensors, components, sensorWeights: weights, contributions,
+        intervalsUsed: gaps.length, favorableSensors, components, sensorWeights: weights, contributions, rawStrengths: rawNormalized, alignmentBonus, baseForce: Number(baseForce.toFixed(2)),
         reasons: [
           `Padrão ativo: ${recurringPattern.label}; ${recurringPattern.cases} ocorrências, ${(patternProbability * 100).toFixed(0)}% de branco até C6; contribuição ${(recurringPattern.strength * weights.patterns).toFixed(2)}/${weights.patterns.toFixed(1)}.`,
           `Similaridade contextual: ${similarity.matches} cenários; chance histórica ${(similarityProbability * 100).toFixed(0)}% (bônus máximo 0,5).`,
-          `Força integrada: ${force.toFixed(2)}/10,0 (mínimo ${this.minimumForce().toFixed(1)}).`,
+          `Força integrada: ${force.toFixed(2)}/10,0 (base ${baseForce.toFixed(2)} + alinhamento ${alignmentBonus.toFixed(2)}; mínimo ${this.minimumForce().toFixed(1)}).`,
           `Intervalo projetado ${projectedGap}; referência ${Math.round(expected)}.`,
           `Pressão estatística: percentil ${(pressurePercentile * 100).toFixed(0)}%.`,
           `Minuto ${String(localMinute).padStart(2, "0")}: taxa ajustada ${(minuteProbability * 100).toFixed(0)}%.`,
