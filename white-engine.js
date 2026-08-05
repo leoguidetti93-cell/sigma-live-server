@@ -45,6 +45,7 @@ class SigmaWhiteEngine {
     this.operationArchive = [];
     this.observationArchive = [];
     this.observationTracking = [];
+    this.patternCatalogCache = { builtAt: 0, rounds: 0, top: [] };
     this.lastHourlySummaryKey = null;
     this.lastDailySummaryKey = null;
     this.whiteDebug = {
@@ -235,7 +236,7 @@ class SigmaWhiteEngine {
     // Padrões ativos são avaliados sobre a sequência que acabou de acontecer.
     // A contribuição cai rapidamente para projeções distantes, pois um padrão
     // curto é especialmente útil para as próximas seis casas.
-    const proximity = clamp(1 - Math.max(0, minuteOffset - 2) / 6, 0, 1);
+    const proximity = minuteOffset <= 3 ? 1 : clamp(1 - (minuteOffset - 3) / 7, 0, 1);
     if (rounds.length < 250 || proximity <= 0) return { strength: 0, probability: 0.33, cases: 0, hits: 0, label: "—", qualified: false, proximity };
     const variants = [];
     for (const length of [2, 3, 4]) {
@@ -282,13 +283,82 @@ class SigmaWhiteEngine {
       const candidate = {
         modes, tokens: currentTokens, label: this.patternLabel(currentTokens), cases, hits,
         hitRate: hits / Math.max(1, cases), probability, strength, houseHits,
-        qualified: cases >= 12 && probability >= 0.58 && strength >= 0.35,
+        qualified: cases >= 10 && probability >= 0.54 && strength >= 0.28,
         proximity
       };
       if (!best || candidate.strength > best.strength || (candidate.strength === best.strength && candidate.cases > best.cases)) best = candidate;
     }
     return best || { strength: 0, probability: 0.33, cases: 0, hits: 0, label: "—", qualified: false, proximity };
   }
+  catalogRecurringWhitePatterns(rounds) {
+    const now = Date.now();
+    if (this.patternCatalogCache.rounds === rounds.length && now - this.patternCatalogCache.builtAt < 60000) {
+      return this.patternCatalogCache.top;
+    }
+    const map = new Map();
+    const add = (tokens, end) => {
+      const key = tokens.join("|");
+      let item = map.get(key);
+      if (!item) item = { tokens, label: this.patternLabel(tokens), cases: 0, hits: 0, houseHits: [0,0,0,0,0,0], weightedCases: 0, weightedHits: 0 };
+      const maxEnd = Math.max(1, rounds.length - 7);
+      const recency = 0.65 + 0.35 * (end / maxEnd);
+      item.cases += 1;
+      item.weightedCases += recency;
+      let hit = false;
+      for (let h = 1; h <= 6; h += 1) {
+        if (normalizeColor(rounds[end + h]) === "white") {
+          hit = true;
+          item.houseHits[h - 1] += 1;
+        }
+      }
+      if (hit) { item.hits += 1; item.weightedHits += recency; }
+      map.set(key, item);
+    };
+    const maxEnd = rounds.length - 7;
+    for (let end = 1; end < maxEnd; end += 1) {
+      for (const length of [2,3,4]) {
+        if (end - length + 1 < 0) continue;
+        const slice = rounds.slice(end - length + 1, end + 1);
+        add(slice.map(r => this.patternToken(r, "color")), end);
+        add(slice.map(r => this.patternToken(r, "number")), end);
+        if (length >= 2) add(slice.map((r, i) => this.patternToken(r, i === length - 1 ? "number" : "color")), end);
+        if (length >= 3) add(slice.map((r, i) => this.patternToken(r, i >= length - 2 ? "number" : "color")), end);
+      }
+    }
+    const top = [...map.values()].filter(x => x.cases >= 8).map(x => {
+      const raw = x.weightedCases ? x.weightedHits / x.weightedCases : x.hits / x.cases;
+      const shrink = x.cases / (x.cases + 14);
+      const probability = raw * shrink + 0.34 * (1 - shrink);
+      const sampleConfidence = clamp((x.cases - 6) / 30, 0, 1);
+      const quality = clamp((probability - 0.34) / 0.38, 0, 1);
+      const strength = clamp(quality * (0.5 + 0.5 * sampleConfidence), 0, 1);
+      return { ...x, probability, hitRate: x.hits / Math.max(1, x.cases), strength, qualified: x.cases >= 10 && probability >= 0.54 && strength >= 0.28 };
+    }).sort((a,b) => (b.strength - a.strength) || (b.cases - a.cases)).slice(0, 30);
+    this.patternCatalogCache = { builtAt: now, rounds: rounds.length, top };
+    return top;
+  }
+  patternLabState() {
+    const rounds = this.chronologicalRounds();
+    const top = this.catalogRecurringWhitePatterns(rounds);
+    const current = this.active?.components?.patterns || null;
+    return {
+      active: current ? {
+        label: current.label || "—", cases: current.cases || 0, hits: current.hits || 0,
+        probability: Number(current.probability || 0), strength: Number(current.strength || 0),
+        contribution: Number(((Number(current.strength || 0) / 100) * this.sensorWeights().patterns).toFixed(2)),
+        maxContribution: this.sensorWeights().patterns, qualified: Boolean(current.qualified), houseHits: current.houseHits || [0,0,0,0,0,0]
+      } : null,
+      top: top.map(p => ({
+        label: p.label, cases: p.cases, hits: p.hits,
+        probability: Number((p.probability * 100).toFixed(1)),
+        hitRate: Number((p.hitRate * 100).toFixed(1)),
+        strength: Number((p.strength * 100).toFixed(1)),
+        contribution: Number((p.strength * this.sensorWeights().patterns).toFixed(2)),
+        qualified: p.qualified, houseHits: p.houseHits
+      }))
+    };
+  }
+
   updateLearning(operation) {
     const y = Number(operation.whitesCaptured || 0) > 0 ? 1 : 0;
     const components = operation.components || {};
@@ -373,6 +443,7 @@ class SigmaWhiteEngine {
       observationTracking: this.observationTracking.slice(0, 50),
       observationArchive: this.observationArchive.slice(0, 500),
       operationArchive: this.operationArchive.slice(0, 500),
+      patternLab: this.patternLabState(),
       observationArchiveCount: this.observationArchive.length,
       updatedAt: new Date().toISOString()
     };
@@ -496,12 +567,13 @@ class SigmaWhiteEngine {
         normalized.similarity * weights.similarity +
         normalized.patterns * weights.patterns
       );
+      const contributions = Object.fromEntries(Object.keys(weights).map(key => [key, Number((normalized[key] * weights[key]).toFixed(3))]));
       const probability = clamp(force / 10, 0.05, 0.98);
 
       const targetMs = target.getTime();
       const candidate = {
         id: `server-white-v3-${targetMs}`,
-        engineVersion: "BRANCO_V4_FORCA_PADROES_INTELIGENTES",
+        engineVersion: "BRANCO_V5_EVIDENCIAS_PADROES_LAB",
         targetAt: target.toISOString(), createdAt: new Date().toISOString(),
         force: Number(force.toFixed(2)), score: Math.round(force * 10),
         signalTier: this.signalTier(force), probability: Number(probability.toFixed(4)), expectedGap: Math.round(expected), sinceAtProjection: since,
@@ -509,7 +581,7 @@ class SigmaWhiteEngine {
         windowStartAt: new Date(targetMs - 60000).toISOString(),
         windowEndAt: new Date(targetMs + 120000).toISOString(), processedHouses: 0,
         sampleQuality: gaps.length >= 40 ? "FULL" : gaps.length >= 12 ? "MODERATE" : "LOW",
-        intervalsUsed: gaps.length, favorableSensors, components, sensorWeights: weights,
+        intervalsUsed: gaps.length, favorableSensors, components, sensorWeights: weights, contributions,
         reasons: [
           `Padrão ativo: ${recurringPattern.label}; ${recurringPattern.cases} ocorrências, ${(patternProbability * 100).toFixed(0)}% de branco até C6; contribuição ${(recurringPattern.strength * weights.patterns).toFixed(2)}/${weights.patterns.toFixed(1)}.`,
           `Similaridade contextual: ${similarity.matches} cenários; chance histórica ${(similarityProbability * 100).toFixed(0)}% (bônus máximo 0,5).`,
