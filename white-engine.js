@@ -293,14 +293,16 @@ class SigmaWhiteEngine {
       enabled: this.enabled,
       mode: "SERVER_24H",
       active: this.active,
-      history: this.history.slice(0, 20),
+      history: this.history.slice(0, 200),
       accuracy: this.history.length ? Math.round((wins / this.history.length) * 100) : null,
       telegramConfigured: Boolean(this.telegramToken && this.telegramChatId),
       cooldownUntil: this.cooldownUntil,
       diagnostics: this.diagnostics(),
       learning: { operations: this.learning.operations || 0, weights: this.sensorWeights(), sensors: this.learning.sensors },
       whiteDebug: this.whiteDebug,
-      observationTracking: this.observationTracking.slice(0, 10),
+      observationTracking: this.observationTracking.slice(0, 50),
+      observationArchive: this.observationArchive.slice(0, 500),
+      operationArchive: this.operationArchive.slice(0, 500),
       observationArchiveCount: this.observationArchive.length,
       updatedAt: new Date().toISOString()
     };
@@ -595,7 +597,7 @@ class SigmaWhiteEngine {
     const whiteHouses = Array.isArray(this.active.whiteHouses) ? [...this.active.whiteHouses] : [];
     const finished = { ...this.active, status, result, house, whiteHouses, whitesCaptured: whiteHouses.length, resolvedAt: roundTime(round) };
     this.history.unshift(finished);
-    this.history = this.history.slice(0, 20);
+    this.history = this.history.slice(0, 200);
     this.saveHistoryState();
     if (finished.classification === "ACTIVE" || Number(finished.force) >= this.minimumForce()) {
       this.operationArchive.unshift(finished);

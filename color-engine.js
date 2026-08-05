@@ -131,7 +131,7 @@ class SigmaColorEngine {
       enabled: this.enabled,
       mode: "SERVER_24H",
       operation: this.operation,
-      history: this.history.slice(0, 20),
+      history: this.history.slice(0, 200),
       nextSignalAllowedAt: this.nextSignalAllowedAt,
       telegramConfigured: Boolean(this.telegramToken && this.telegramChatId),
       stats: this.stats.days[dayKey()] || this.emptyStats(),
@@ -407,7 +407,7 @@ class SigmaColorEngine {
     await this.sendEvent("RESULT", finished);
     this.recordStats(finished);
     this.history.unshift(finished);
-    this.history = this.history.slice(0, 20);
+    this.history = this.history.slice(0, 200);
     this.operation = null;
     this.nextSignalAllowedAt = Date.now() + 1000;
     this.emitState();
