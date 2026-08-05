@@ -14,7 +14,7 @@ const SigmaColorEngine = require("./color-engine");
 const SigmaWhiteEngine = require("./white-engine");
 const HistoryLoader = require("./history-loader");
 
-const APP_VERSION = "1.6.4";
+const APP_VERSION = "1.6.5";
 const ACCESS_TABLE = "sigma_access";
 const LICENSE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LICENSE_LENGTH = 6;

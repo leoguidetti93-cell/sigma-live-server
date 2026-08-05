@@ -45,7 +45,7 @@ class SigmaWhiteEngine {
     this.operationArchive = [];
     this.observationArchive = [];
     this.observationTracking = [];
-    this.patternCatalogCache = { builtAt: 0, rounds: 0, top: [] };
+    this.patternCatalogCache = { builtAt: 0, rounds: 0, lastKey: "", top: [] };
     this.lastHourlySummaryKey = null;
     this.lastDailySummaryKey = null;
     this.whiteDebug = {
@@ -233,66 +233,30 @@ class SigmaWhiteEngine {
     return tokens.map(token => token === "R" ? "🔴" : token === "B" ? "⚫" : token === "W" ? "⚪" : token.replace(/^N/, "")).join(" + ");
   }
   recurringWhitePatternSensor(rounds, minuteOffset) {
-    // Padrões ativos são avaliados sobre a sequência que acabou de acontecer.
-    // A contribuição cai rapidamente para projeções distantes, pois um padrão
-    // curto é especialmente útil para as próximas seis casas.
+    // Usa exatamente o mesmo catálogo exibido no LAB. Assim, quando um padrão
+    // aparece na lista e volta a ocorrer na sequência atual, a mesma força e a
+    // mesma contribuição entram no cálculo do candidato.
     const proximity = minuteOffset <= 3 ? 1 : clamp(1 - (minuteOffset - 3) / 7, 0, 1);
-    if (rounds.length < 250 || proximity <= 0) return { strength: 0, probability: 0.33, cases: 0, hits: 0, label: "—", qualified: false, proximity };
-    const variants = [];
-    for (const length of [2, 3, 4]) {
-      if (rounds.length <= length + 12) continue;
-      variants.push(Array(length).fill("color"));
-      variants.push(Array(length).fill("number"));
-      variants.push([...Array(Math.max(0, length - 1)).fill("color"), "number"]);
-      if (length >= 3) variants.push([...Array(length - 2).fill("color"), "number", "number"]);
+    if (rounds.length < 250 || proximity <= 0) return { strength: 0, probability: 0.34, cases: 0, hits: 0, label: "—", qualified: false, proximity, contribution: 0 };
+    const catalog = this.catalogRecurringWhitePatterns(rounds);
+    const candidates = [];
+    for (const item of catalog) {
+      const len = item.tokens?.length || 0;
+      if (!len || rounds.length < len) continue;
+      const suffix = rounds.slice(-len);
+      // Cada token informa o tipo pelo prefixo: N = número; R/B/W = cor.
+      const currentTokens = suffix.map((round, i) => item.tokens[i]?.startsWith('N') ? this.patternToken(round, 'number') : this.patternToken(round, 'color'));
+      if (currentTokens.join('|') !== item.tokens.join('|')) continue;
+      const strength = clamp(Number(item.strength || 0) * proximity, 0, 1);
+      candidates.push({ ...item, strength, proximity, contribution: Number((strength * this.sensorWeights().patterns).toFixed(3)) });
     }
-    let best = null;
-    for (const modes of variants) {
-      const length = modes.length;
-      const currentTokens = rounds.slice(-length).map((round, idx) => this.patternToken(round, modes[idx]));
-      let cases = 0, hits = 0, weightedHits = 0, weightedCases = 0;
-      const houseHits = [0,0,0,0,0,0];
-      const maxEnd = rounds.length - 7;
-      for (let end = length - 1; end < maxEnd; end += 1) {
-        let match = true;
-        for (let j = 0; j < length; j += 1) {
-          if (this.patternToken(rounds[end - length + 1 + j], modes[j]) !== currentTokens[j]) { match = false; break; }
-        }
-        if (!match) continue;
-        cases += 1;
-        // Ocorrências mais recentes têm peso discretamente maior, sem apagar o histórico.
-        const recency = 0.65 + 0.35 * (end / Math.max(1, maxEnd));
-        weightedCases += recency;
-        let hit = false;
-        for (let h = 1; h <= 6; h += 1) {
-          if (normalizeColor(rounds[end + h]) === "white") {
-            hit = true;
-            houseHits[h - 1] += 1;
-          }
-        }
-        if (hit) { hits += 1; weightedHits += recency; }
-      }
-      if (cases < 6) continue;
-      const rawRate = weightedCases ? weightedHits / weightedCases : hits / cases;
-      const prior = 0.34;
-      const shrink = cases / (cases + 14);
-      const probability = rawRate * shrink + prior * (1 - shrink);
-      const sampleConfidence = clamp((cases - 6) / 28, 0, 1);
-      const quality = clamp((probability - 0.34) / 0.38, 0, 1);
-      const strength = clamp(quality * (0.50 + 0.50 * sampleConfidence) * proximity, 0, 1);
-      const candidate = {
-        modes, tokens: currentTokens, label: this.patternLabel(currentTokens), cases, hits,
-        hitRate: hits / Math.max(1, cases), probability, strength, houseHits,
-        qualified: cases >= 10 && probability >= 0.54 && strength >= 0.28,
-        proximity
-      };
-      if (!best || candidate.strength > best.strength || (candidate.strength === best.strength && candidate.cases > best.cases)) best = candidate;
-    }
-    return best || { strength: 0, probability: 0.33, cases: 0, hits: 0, label: "—", qualified: false, proximity };
+    candidates.sort((a,b)=>(b.strength-a.strength)||(b.cases-a.cases));
+    return candidates[0] || { strength: 0, probability: 0.34, cases: 0, hits: 0, label: "—", qualified: false, proximity, contribution: 0 };
   }
   catalogRecurringWhitePatterns(rounds) {
     const now = Date.now();
-    if (this.patternCatalogCache.rounds === rounds.length && now - this.patternCatalogCache.builtAt < 60000) {
+    const lastKey = roundKey(rounds.at(-1));
+    if (this.patternCatalogCache.rounds === rounds.length && this.patternCatalogCache.lastKey === lastKey && now - this.patternCatalogCache.builtAt < 60000) {
       return this.patternCatalogCache.top;
     }
     const map = new Map();
@@ -334,18 +298,18 @@ class SigmaWhiteEngine {
       const strength = clamp(quality * (0.5 + 0.5 * sampleConfidence), 0, 1);
       return { ...x, probability, hitRate: x.hits / Math.max(1, x.cases), strength, qualified: x.cases >= 10 && probability >= 0.54 && strength >= 0.28 };
     }).sort((a,b) => (b.strength - a.strength) || (b.cases - a.cases)).slice(0, 30);
-    this.patternCatalogCache = { builtAt: now, rounds: rounds.length, top };
+    this.patternCatalogCache = { builtAt: now, rounds: rounds.length, lastKey, top };
     return top;
   }
   patternLabState() {
     const rounds = this.chronologicalRounds();
     const top = this.catalogRecurringWhitePatterns(rounds);
-    const current = this.active?.components?.patterns || null;
+    const current = this.active?.components?.patterns || this.whiteDebug?.bestPattern || null;
     return {
       active: current ? {
         label: current.label || "—", cases: current.cases || 0, hits: current.hits || 0,
         probability: Number(current.probability || 0), strength: Number(current.strength || 0),
-        contribution: Number(((Number(current.strength || 0) / 100) * this.sensorWeights().patterns).toFixed(2)),
+        contribution: Number(current.contribution ?? ((Number(current.strength || 0) / 100) * this.sensorWeights().patterns).toFixed(2)),
         maxContribution: this.sensorWeights().patterns, qualified: Boolean(current.qualified), houseHits: current.houseHits || [0,0,0,0,0,0]
       } : null,
       top: top.map(p => ({
@@ -542,7 +506,8 @@ class SigmaWhiteEngine {
           probability: patternProbability, strength: Number((recurringPattern.strength * 100).toFixed(1)),
           label: recurringPattern.label, cases: recurringPattern.cases, hits: recurringPattern.hits,
           hitRate: Number((recurringPattern.hitRate || 0).toFixed(4)), qualified: recurringPattern.qualified,
-          houseHits: recurringPattern.houseHits || [0,0,0,0,0,0]
+          houseHits: recurringPattern.houseHits || [0,0,0,0,0,0],
+          contribution: Number((recurringPattern.strength * weights.patterns).toFixed(3))
         }
       };
       const normalized = {
@@ -573,7 +538,7 @@ class SigmaWhiteEngine {
       const targetMs = target.getTime();
       const candidate = {
         id: `server-white-v3-${targetMs}`,
-        engineVersion: "BRANCO_V5_EVIDENCIAS_PADROES_LAB",
+        engineVersion: "BRANCO_V6_PADROES_CATALOGO_INTEGRADO",
         targetAt: target.toISOString(), createdAt: new Date().toISOString(),
         force: Number(force.toFixed(2)), score: Math.round(force * 10),
         signalTier: this.signalTier(force), probability: Number(probability.toFixed(4)), expectedGap: Math.round(expected), sinceAtProjection: since,
@@ -602,6 +567,7 @@ class SigmaWhiteEngine {
       bestVotes: best?.favorableSensors ?? null,
       bestTargetAt: best?.targetAt ?? null,
       bestClassification: best?.classification ?? null,
+      bestPattern: best?.components?.patterns || null,
       lastEvaluationAt: new Date().toISOString(),
       status: best ? (best.classification === "ACTIVE" ? "SIGNAL_READY" : "OBSERVING") : "NO_CANDIDATE",
       minimumForce: this.minimumForce(),
