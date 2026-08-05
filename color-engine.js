@@ -426,22 +426,11 @@ class SigmaColorEngine {
     if (legacyPattern) baseScore = Math.round(legacyPattern.success * 0.65 + Math.min(100, legacyPattern.cases * 3) * 0.20 + Math.min(100, Math.abs(redP - blackP) * 4) * 0.15);
     if (streak.count >= 3) baseScore = Math.min(96, baseScore + 5);
 
-    // Um padrão recorrente forte pode mudar o alvo apenas com suporte e vantagem claros.
-    const activePattern = recurringPatterns.active;
-    const targetPattern = recurringPatterns.bestByTarget?.[target];
-    const opposite = target === "red" ? "black" : "red";
-    const oppositePattern = recurringPatterns.bestByTarget?.[opposite];
-    if (activePattern?.qualified && activePattern.target !== target && activePattern.cases >= 15 &&
-        activePattern.successG1 >= 68 && activePattern.strength >= (targetPattern?.strength || 0) + 8) {
-      target = activePattern.target;
-    }
-
+    // Os padrões recorrentes permanecem disponíveis apenas para diagnóstico no LAB COLOR.
+    // A decisão operacional do COLOR volta a usar somente a leitura consolidada anterior.
     const similarity = this.similaritySensor(rounds, target);
     const selectedPattern = recurringPatterns.bestByTarget?.[target];
-    const patternScore = selectedPattern ? selectedPattern.strength : 50;
-    // Preserva a leitura anterior e adiciona padrões como confirmação, não como gatilho isolado.
-    let score = Math.round(baseScore * 0.65 + similarity.score * 0.15 + patternScore * 0.20);
-    if (selectedPattern?.qualified) score += Math.min(5, Math.max(1, Math.round((selectedPattern.successG1 - 65) / 4)));
+    let score = Math.round(baseScore * 0.80 + similarity.score * 0.20);
     score = Math.max(0, Math.min(99, score));
     const grade = score >= 84 ? "FORTE" : score >= 72 ? "ATENÇÃO" : score < 45 ? "EVITAR" : "NEUTRO";
     return {

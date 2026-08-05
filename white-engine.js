@@ -67,7 +67,8 @@ class SigmaWhiteEngine {
         pressure: { mae: 0.30, n: 0 },
         density: { mae: 0.30, n: 0 },
         dispersion: { mae: 0.30, n: 0 },
-        similarity: { mae: 0.26, n: 0 }
+        similarity: { mae: 0.26, n: 0 },
+        patterns: { mae: 0.30, n: 0 }
       }
     };
     this.loadLearning();
@@ -122,6 +123,7 @@ class SigmaWhiteEngine {
           this.learning.sensors.dispersion = this.learning.sensors.stability;
         }
         if (!this.learning.sensors.pressure) this.learning.sensors.pressure = { mae: 0.30, n: 0 };
+        if (!this.learning.sensors.patterns) this.learning.sensors.patterns = { mae: 0.30, n: 0 };
         delete this.learning.sensors.stability;
       }
       if (Array.isArray(saved?.operationArchive)) this.operationArchive = saved.operationArchive.slice(0, 2500);
@@ -152,12 +154,13 @@ class SigmaWhiteEngine {
     // Índice único de força (0 a 10). A similaridade atua apenas como bônus
     // pequeno e nunca funciona como trava isolada.
     return {
-      gap: 3.0,
-      pressure: 2.5,
-      density: 1.8,
-      dispersion: 1.2,
+      gap: 2.4,
+      pressure: 2.0,
+      density: 1.5,
+      dispersion: 1.1,
       minute: 1.0,
-      similarity: 0.5
+      similarity: 0.5,
+      patterns: 1.5
     };
   }
   minimumForce() { return 6.2; }
@@ -218,6 +221,73 @@ class SigmaWhiteEngine {
     const probability = raw * shrink + prior * (1 - shrink);
     const agreement = Math.abs(raw - 0.5) * 2;
     return { probability: clamp(probability, 0.05, 0.92), matches: top.length, confidence: clamp(top.length / 45, 0, 1), agreement };
+  }
+  patternToken(round, mode) {
+    const color = normalizeColor(round);
+    const roll = Number(round?.roll ?? round?.number ?? round?.value);
+    if (mode === "number" && Number.isFinite(roll)) return `N${roll}`;
+    return color === "red" ? "R" : color === "black" ? "B" : "W";
+  }
+  patternLabel(tokens) {
+    return tokens.map(token => token === "R" ? "🔴" : token === "B" ? "⚫" : token === "W" ? "⚪" : token.replace(/^N/, "")).join(" + ");
+  }
+  recurringWhitePatternSensor(rounds, minuteOffset) {
+    // Padrões ativos são avaliados sobre a sequência que acabou de acontecer.
+    // A contribuição cai rapidamente para projeções distantes, pois um padrão
+    // curto é especialmente útil para as próximas seis casas.
+    const proximity = clamp(1 - Math.max(0, minuteOffset - 2) / 6, 0, 1);
+    if (rounds.length < 250 || proximity <= 0) return { strength: 0, probability: 0.33, cases: 0, hits: 0, label: "—", qualified: false, proximity };
+    const variants = [];
+    for (const length of [2, 3, 4]) {
+      if (rounds.length <= length + 12) continue;
+      variants.push(Array(length).fill("color"));
+      variants.push(Array(length).fill("number"));
+      variants.push([...Array(Math.max(0, length - 1)).fill("color"), "number"]);
+      if (length >= 3) variants.push([...Array(length - 2).fill("color"), "number", "number"]);
+    }
+    let best = null;
+    for (const modes of variants) {
+      const length = modes.length;
+      const currentTokens = rounds.slice(-length).map((round, idx) => this.patternToken(round, modes[idx]));
+      let cases = 0, hits = 0, weightedHits = 0, weightedCases = 0;
+      const houseHits = [0,0,0,0,0,0];
+      const maxEnd = rounds.length - 7;
+      for (let end = length - 1; end < maxEnd; end += 1) {
+        let match = true;
+        for (let j = 0; j < length; j += 1) {
+          if (this.patternToken(rounds[end - length + 1 + j], modes[j]) !== currentTokens[j]) { match = false; break; }
+        }
+        if (!match) continue;
+        cases += 1;
+        // Ocorrências mais recentes têm peso discretamente maior, sem apagar o histórico.
+        const recency = 0.65 + 0.35 * (end / Math.max(1, maxEnd));
+        weightedCases += recency;
+        let hit = false;
+        for (let h = 1; h <= 6; h += 1) {
+          if (normalizeColor(rounds[end + h]) === "white") {
+            hit = true;
+            houseHits[h - 1] += 1;
+          }
+        }
+        if (hit) { hits += 1; weightedHits += recency; }
+      }
+      if (cases < 6) continue;
+      const rawRate = weightedCases ? weightedHits / weightedCases : hits / cases;
+      const prior = 0.34;
+      const shrink = cases / (cases + 14);
+      const probability = rawRate * shrink + prior * (1 - shrink);
+      const sampleConfidence = clamp((cases - 6) / 28, 0, 1);
+      const quality = clamp((probability - 0.34) / 0.38, 0, 1);
+      const strength = clamp(quality * (0.50 + 0.50 * sampleConfidence) * proximity, 0, 1);
+      const candidate = {
+        modes, tokens: currentTokens, label: this.patternLabel(currentTokens), cases, hits,
+        hitRate: hits / Math.max(1, cases), probability, strength, houseHits,
+        qualified: cases >= 12 && probability >= 0.58 && strength >= 0.35,
+        proximity
+      };
+      if (!best || candidate.strength > best.strength || (candidate.strength === best.strength && candidate.cases > best.cases)) best = candidate;
+    }
+    return best || { strength: 0, probability: 0.33, cases: 0, hits: 0, label: "—", qualified: false, proximity };
   }
   updateLearning(operation) {
     const y = Number(operation.whitesCaptured || 0) > 0 ? 1 : 0;
@@ -387,6 +457,8 @@ class SigmaWhiteEngine {
 
       const similarity = this.similarityForecast(rounds, since, horizonRounds);
       const similarityProbability = similarity.probability;
+      const recurringPattern = this.recurringWhitePatternSensor(rounds, minuteOffset);
+      const patternProbability = recurringPattern.probability;
 
       const components = {
         gap: { probability: gapProbability },
@@ -394,7 +466,13 @@ class SigmaWhiteEngine {
         density: { probability: densityProbability },
         dispersion: { probability: dispersionProbability },
         minute: { probability: minuteProbability },
-        similarity: { probability: similarityProbability, matches: similarity.matches, confidence: similarity.confidence }
+        similarity: { probability: similarityProbability, matches: similarity.matches, confidence: similarity.confidence },
+        patterns: {
+          probability: patternProbability, strength: Number((recurringPattern.strength * 100).toFixed(1)),
+          label: recurringPattern.label, cases: recurringPattern.cases, hits: recurringPattern.hits,
+          hitRate: Number((recurringPattern.hitRate || 0).toFixed(4)), qualified: recurringPattern.qualified,
+          houseHits: recurringPattern.houseHits || [0,0,0,0,0,0]
+        }
       };
       const normalized = {
         gap: this.normalizeSensor(gapProbability, 0.06, 0.84),
@@ -402,7 +480,8 @@ class SigmaWhiteEngine {
         density: this.normalizeSensor(densityProbability, 0.10, 0.68),
         dispersion: this.normalizeSensor(dispersionProbability, 0.12, 0.72),
         minute: this.normalizeSensor(minuteProbability, 0.08, 0.78),
-        similarity: this.normalizeSensor(similarityProbability, 0.05, 0.92)
+        similarity: this.normalizeSensor(similarityProbability, 0.05, 0.92),
+        patterns: recurringPattern.strength
       };
       Object.entries(normalized).forEach(([key, strength]) => {
         components[key].strength = Number((strength * 100).toFixed(1));
@@ -414,14 +493,15 @@ class SigmaWhiteEngine {
         normalized.density * weights.density +
         normalized.dispersion * weights.dispersion +
         normalized.minute * weights.minute +
-        normalized.similarity * weights.similarity
+        normalized.similarity * weights.similarity +
+        normalized.patterns * weights.patterns
       );
       const probability = clamp(force / 10, 0.05, 0.98);
 
       const targetMs = target.getTime();
       const candidate = {
         id: `server-white-v3-${targetMs}`,
-        engineVersion: "BRANCO_V3_FORCA_0_A_10_MULTI_WHITE",
+        engineVersion: "BRANCO_V4_FORCA_PADROES_INTELIGENTES",
         targetAt: target.toISOString(), createdAt: new Date().toISOString(),
         force: Number(force.toFixed(2)), score: Math.round(force * 10),
         signalTier: this.signalTier(force), probability: Number(probability.toFixed(4)), expectedGap: Math.round(expected), sinceAtProjection: since,
@@ -431,12 +511,13 @@ class SigmaWhiteEngine {
         sampleQuality: gaps.length >= 40 ? "FULL" : gaps.length >= 12 ? "MODERATE" : "LOW",
         intervalsUsed: gaps.length, favorableSensors, components, sensorWeights: weights,
         reasons: [
-          `Similaridade: ${similarity.matches} cenários; chance histórica ${(similarityProbability * 100).toFixed(0)}% (bônus máximo 0,5).`,
-          `Força dos sensores: ${force.toFixed(2)}/10,0 (mínimo ${this.minimumForce().toFixed(1)}).`,
+          `Padrão ativo: ${recurringPattern.label}; ${recurringPattern.cases} ocorrências, ${(patternProbability * 100).toFixed(0)}% de branco até C6; contribuição ${(recurringPattern.strength * weights.patterns).toFixed(2)}/${weights.patterns.toFixed(1)}.`,
+          `Similaridade contextual: ${similarity.matches} cenários; chance histórica ${(similarityProbability * 100).toFixed(0)}% (bônus máximo 0,5).`,
+          `Força integrada: ${force.toFixed(2)}/10,0 (mínimo ${this.minimumForce().toFixed(1)}).`,
           `Intervalo projetado ${projectedGap}; referência ${Math.round(expected)}.`,
           `Pressão estatística: percentil ${(pressurePercentile * 100).toFixed(0)}%.`,
           `Minuto ${String(localMinute).padStart(2, "0")}: taxa ajustada ${(minuteProbability * 100).toFixed(0)}%.`,
-          `Sensores favoráveis: ${favorableSensors}/6; decisão feita apenas pela força ponderada.`,
+          `Fontes favoráveis: ${favorableSensors}/7; decisão feita pela força integrada.`,
           `Aprendizado contínuo: ${this.learning.operations || 0} operações avaliadas.`
         ]
       };
@@ -452,7 +533,7 @@ class SigmaWhiteEngine {
       lastEvaluationAt: new Date().toISOString(),
       status: best ? (best.classification === "ACTIVE" ? "SIGNAL_READY" : "OBSERVING") : "NO_CANDIDATE",
       minimumForce: this.minimumForce(),
-      rule: `Força ${this.minimumForce().toFixed(1)}+ em escala de 0 a 10`
+      rule: `Força integrada ${this.minimumForce().toFixed(1)}+ em escala de 0 a 10, incluindo padrões recorrentes`
     };
     // Mantém sempre o melhor candidato visível em observação, mesmo com score baixo.
     // A publicação no Telegram continua restrita às regras de score e consenso.
@@ -722,7 +803,7 @@ class SigmaWhiteEngine {
     const avgForce = items => items.length ? items.reduce((a,b) => a + (Number(b.force)||0),0) / items.length : 0;
     const paying = operations.filter(x => Number(x.whitesCaptured || 0) > 0);
     const losses = operations.filter(x => Number(x.whitesCaptured || 0) === 0);
-    const sensorNames = { gap:"Intervalo", pressure:"Pressão", density:"Densidade", dispersion:"Dispersão", minute:"Minuto", similarity:"Similaridade" };
+    const sensorNames = { gap:"Intervalo", pressure:"Pressão", density:"Densidade", dispersion:"Dispersão", minute:"Minuto", similarity:"Similaridade", patterns:"Padrões" };
     const sensorLine = group => Object.entries(sensorNames).map(([k,n]) => {
       const vals = group.map(x => Number(x.components?.[k]?.strength)).filter(Number.isFinite);
       return `${n}: ${vals.length ? (vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(1).replace(".", ",") : "0,0"}%`;
