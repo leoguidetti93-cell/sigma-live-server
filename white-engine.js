@@ -823,36 +823,29 @@ ${sensorLine(losses)}`;
     operation.telegramSignalSent = true;
     operation.whiteHouses = [];
     operation.whitesCaptured = 0;
-    const tier = operation.signalTier || this.signalTier(operation.force || 0);
-    const header = tier === "ELITE" ? "👑 SIGMA BRANCO • SINAL ELITE" : tier === "FORTE" ? "🔥 SIGMA BRANCO • SINAL FORTE" : "Σ SIGMA LEITURA • ⚪ BRANCO";
-    const badge = tier === "ELITE" ? "\n🚨 CENÁRIO RARÍSSIMO" : tier === "FORTE" ? "\n💪 FORÇA ELEVADA" : "";
-    const strengths = Object.entries(operation.components || {}).sort((a,b)=>(b[1].strength||0)-(a[1].strength||0)).slice(0,3).map(([k,v]) => `✔ ${({gap:"Intervalo",pressure:"Pressão",density:"Densidade",dispersion:"Dispersão",minute:"Minuto",similarity:"Similaridade"})[k]} ${Number(v.strength||0).toFixed(0)}%`).join("\n");
-    await this.sendTelegram(`${header}
-
-⚪ BRANCO PROJETADO
+    await this.sendTelegram(`Σ SIGMA LEITURA • ⚪️ BRANCO
 
 ⏰ Horário central: ${fmtTime(operation.targetAt)}
 🕒 Janela: ${fmtTime(operation.windowStartAt)} até ${fmtTime(new Date(new Date(operation.targetAt).getTime() + 60000))}
-🎯 Margem: 6 casas
-⚡ Força: ${Number(operation.force || 0).toFixed(2).replace(".", ",")} / 10,0${badge}${strengths ? `
 
-${strengths}` : ""}`);
+⚡️ Força: ${Number(operation.force || 0).toFixed(2).replace(".", ",")} / 10,0`);
   }
   async sendResult(operation) {
     if (operation.status === "WIN") {
-      const houses = (operation.whiteHouses || []).map(h => `C${h}`).join(" • ");
+      const whiteHouses = Array.isArray(operation.whiteHouses) ? operation.whiteHouses : [];
+      const houses = whiteHouses.map(h => `C${h}`).join(" • ");
+      const houseLabel = whiteHouses.length === 1 ? "🏠 Casa" : "🏠 Casas";
       await this.sendTelegram(`✅⚪️ ${operation.result}
 
-🏠 Casas: ${houses || "—"}
-⚪ Brancos capturados: ${operation.whitesCaptured || 0}
 ⏰ Projeção: ${fmtTime(operation.targetAt)}
-⚡ Força: ${Number(operation.force || 0).toFixed(2).replace(".", ",")} / 10,0`);
+${houseLabel}: ${houses || "—"}
+⚪️ Brancos capturados: ${operation.whitesCaptured || 0}`);
       return;
     }
-    await this.sendTelegram(`❌ ⚪ BRANCO NÃO OCORREU
+    await this.sendTelegram(`❌ ⚪️ BRANCO NÃO OCORREU
 
 ⏰ Projeção: ${fmtTime(operation.targetAt)}
-⚡ Força: ${Number(operation.force || 0).toFixed(2).replace(".", ",")} / 10,0`);
+⚪️ Brancos capturados: 0`);
   }
   emitState() { this.broadcast("white-reading", this.state()); }
 }
