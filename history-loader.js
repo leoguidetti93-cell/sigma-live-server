@@ -68,40 +68,6 @@ class HistoryLoader {
     };
   }
 
-
-  async loadRecent() {
-    const templates = String(process.env.BLAZE_HISTORY_URLS || "")
-      .split(",")
-      .map(v => v.trim())
-      .filter(Boolean);
-    const sources = templates.length ? templates : DEFAULT_SOURCES;
-    let lastError = null;
-
-    for (const template of sources) {
-      const url = template.includes("{page}") ? template.replace("{page}", "1") : template;
-      try {
-        const data = await fetchJson(url, 8000);
-        const list = extractList(data);
-        const normalized = list
-          .map(item => this.memory.normalize(item))
-          .filter(Boolean)
-          .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-
-        const missing = [];
-        for (const round of normalized) {
-          const key = this.memory.createKey(round);
-          if (!this.memory.keys.has(key)) missing.push(round);
-        }
-        return missing;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-
-    if (lastError) throw lastError;
-    return [];
-  }
-
   async load() {
     if (this.running) return this.state();
     this.running = true;

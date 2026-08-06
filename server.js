@@ -14,7 +14,7 @@ const SigmaColorEngine = require("./color-engine");
 const SigmaWhiteEngine = require("./white-engine");
 const HistoryLoader = require("./history-loader");
 
-const APP_VERSION = "1.7.1";
+const APP_VERSION = "1.7.0";
 const ACCESS_TABLE = "sigma_access";
 const LICENSE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LICENSE_LENGTH = 6;
@@ -901,34 +901,27 @@ function broadcast(event, payload) {
   }
 }
 
-function processIncomingRound(round, source = "LIVE") {
+live.on("round", round => {
   const inserted = memory.add(round);
 
   if (!inserted) {
-    return false;
+    console.log(
+      `[LIVE] Rodada duplicada ignorada: ${round.id}`
+    );
+    return;
   }
 
   console.log(
-    `[${source}] Rodada armazenada: id=${round.id} roll=${round.roll} color=${round.color} memória=${memory.size()}`
+    `[LIVE] Rodada armazenada: id=${round.id} roll=${round.roll} color=${round.color} memória=${memory.size()}`
   );
 
   broadcast("round", {
     round,
-    count: memory.size(),
-    source
+    count: memory.size()
   });
 
   colorEngine?.enqueueRound(round);
   whiteEngine?.enqueueRound(round);
-  return true;
-}
-
-live.on("round", round => {
-  const inserted = processIncomingRound(round, "LIVE");
-
-  if (!inserted) {
-    console.log(`[LIVE] Rodada duplicada ignorada: ${round.id}`);
-  }
 });
 
 live.on("state", state => {
@@ -937,22 +930,6 @@ live.on("state", state => {
     rounds: memory.size()
   });
 });
-
-
-
-async function reconcileRecentRounds() {
-  try {
-    const recovered = await historyLoader.loadRecent();
-    if (!Array.isArray(recovered) || !recovered.length) return;
-    for (const round of recovered) processIncomingRound(round, "HTTP-REPAIR");
-    console.log(`[HTTP-REPAIR] ${recovered.length} rodada(s) ausente(s) recuperada(s).`);
-  } catch (error) {
-    console.warn(`[HTTP-REPAIR] Falha na reconciliação recente: ${error?.message || error}`);
-  }
-}
-
-setTimeout(reconcileRecentRounds, 4000);
-setInterval(reconcileRecentRounds, 12000);
 
 const server = app.listen(
   config.port,
