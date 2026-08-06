@@ -44,14 +44,13 @@ function dayKey(date = new Date()) {
   return `${p.year}-${p.month}-${p.day}`;
 }
 
-function halfHourKey(date = new Date()) {
+function hourKey(date = new Date()) {
   const p = dayParts(date);
-  return `${p.year}-${p.month}-${p.day}T${p.hour}:${Number(p.minute) < 30 ? "00" : "30"}`;
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:00`;
 }
 
-function previousHalfHourKey(date = new Date()) {
-  const d = new Date(date.getTime() - 30 * 60 * 1000);
-  return halfHourKey(d);
+function previousHourKey(date = new Date()) {
+  return hourKey(new Date(date.getTime() - 60 * 60 * 1000));
 }
 
 class SigmaColorEngine {
@@ -568,7 +567,7 @@ Manter entrada no ${colorEmoji(operation.target)} ${colorName(operation.target)}
 
   recordStats(item) {
     const dKey = dayKey(new Date(item.resolvedAt));
-    const sKey = halfHourKey(new Date(item.resolvedAt));
+    const sKey = hourKey(new Date(item.resolvedAt));
     for (const bucket of [this.stats.days[dKey] ||= this.emptyStats(), this.stats.sessions[sKey] ||= this.emptyStats()]) {
       bucket.signals += 1;
       if (item.result === "LOSS") bucket.losses += 1;
@@ -582,8 +581,8 @@ Manter entrada no ${colorEmoji(operation.target)} ${colorName(operation.target)}
   async processSummaries() {
     if (!this.enabled) return;
     const now = new Date();
-    const currentSlot = halfHourKey(now);
-    const previousSlot = previousHalfHourKey(now);
+    const currentSlot = hourKey(now);
+    const previousSlot = previousHourKey(now);
     if (this.summaryState.currentSlot && this.summaryState.currentSlot !== currentSlot && this.summaryState.lastSessionSent !== previousSlot) {
       const bucket = this.stats.sessions[previousSlot] || this.emptyStats();
       await this.sendSummary("SESSION", bucket, previousSlot);
@@ -591,16 +590,19 @@ Manter entrada no ${colorEmoji(operation.target)} ${colorName(operation.target)}
       this.schedulePersistentState();
     }
     this.summaryState.currentSlot = currentSlot;
-    const p = dayParts(now), today = dayKey(now);
-    if (p.hour === "23" && p.minute === "59" && this.summaryState.lastDailySent !== today) {
-      await this.sendSummary("DAILY", this.stats.days[today] || this.emptyStats(), today);
-      this.summaryState.lastDailySent = today;
-      this.schedulePersistentState();
+    const p = dayParts(now);
+    if (p.hour === "00" && Number(p.minute) >= 1 && Number(p.minute) <= 10) {
+      const previousDay = dayKey(new Date(now.getTime() - 60 * 60 * 1000));
+      if (!this.operation && this.summaryState.lastDailySent !== previousDay) {
+        await this.sendSummary("DAILY", this.stats.days[previousDay] || this.emptyStats(), previousDay);
+        this.summaryState.lastDailySent = previousDay;
+        this.schedulePersistentState();
+      }
     }
   }
 
   async sendSummary(type, bucket, period) {
-    const title = type === "DAILY" ? "RESULTADO GERAL DO DIA" : "RESULTADO DA SESSÃO • 30 MIN";
+    const title = type === "DAILY" ? "RESULTADO GERAL DO DIA" : "RESULTADO DA SESSÃO • 1 HORA";
     const text = `Σ SIGMA LEITURA • COLOR\n\n⏱ ${title}\n\n📡 Sinais: ${bucket.signals || 0}\n✅ Wins: ${bucket.wins || 0}\n⚪ Brancos: ${bucket.whites || 0}\n❌ Loss: ${bucket.losses || 0}\n📊 Assertividade: ${this.accuracy(bucket)}%`;
     await this.sendTelegram(text);
     console.log(`[SIGMA COLOR] Resumo ${type} enviado: ${period}`);

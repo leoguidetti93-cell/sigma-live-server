@@ -155,16 +155,16 @@ class SigmaWhiteEngine {
     // Índice único de força (0 a 10). A similaridade atua apenas como bônus
     // pequeno e nunca funciona como trava isolada.
     return {
-      gap: 2.4,
-      pressure: 2.0,
+      gap: 1.9,
+      pressure: 1.9,
       density: 1.5,
-      dispersion: 1.1,
-      minute: 1.0,
-      similarity: 0.5,
-      patterns: 1.5
+      dispersion: 1.5,
+      minute: 1.3,
+      similarity: 1.1,
+      patterns: 0.8
     };
   }
-  minimumForce() { return 6.2; }
+  minimumForce() { return 4.5; }
   signalTier(force) {
     if (force >= 8.5) return "ELITE";
     if (force >= 7.4) return "FORTE";
@@ -192,7 +192,7 @@ class SigmaWhiteEngine {
   similarityForecast(rounds, since, horizonRounds) {
     const currentEnd = rounds.length - 1;
     const windows = [8, 15, 25].filter(n => rounds.length > n + horizonRounds + 8);
-    if (!windows.length) return { probability: 0.18, matches: 0, confidence: 0, agreement: 0 };
+    if (!windows.length) return { probability: 0.18, matches: 0, hits: 0, confidence: 0, agreement: 0 };
     const matches = [];
     let lastWhite = -1;
     const sinceAt = [];
@@ -213,7 +213,7 @@ class SigmaWhiteEngine {
     }
     matches.sort((a, b) => b.combined - a.combined);
     const top = matches.slice(0, 80);
-    if (top.length < 5) return { probability: 0.18, matches: top.length, confidence: top.length / 5 * 0.35, agreement: 0 };
+    if (top.length < 5) return { probability: 0.18, matches: top.length, hits: top.filter(x => x.hit).length, confidence: top.length / 5 * 0.35, agreement: 0 };
     let hitWeight = 0, totalWeight = 0;
     top.forEach(m => { const w = m.combined ** 3; totalWeight += w; if (m.hit) hitWeight += w; });
     const raw = totalWeight ? hitWeight / totalWeight : 0;
@@ -221,7 +221,7 @@ class SigmaWhiteEngine {
     const shrink = top.length / (top.length + 18);
     const probability = raw * shrink + prior * (1 - shrink);
     const agreement = Math.abs(raw - 0.5) * 2;
-    return { probability: clamp(probability, 0.05, 0.92), matches: top.length, confidence: clamp(top.length / 45, 0, 1), agreement };
+    return { probability: clamp(probability, 0.05, 0.92), matches: top.length, hits: top.filter(x => x.hit).length, confidence: clamp(top.length / 45, 0, 1), agreement };
   }
   patternToken(round, mode) {
     const color = normalizeColor(round);
@@ -407,7 +407,6 @@ class SigmaWhiteEngine {
       observationTracking: this.observationTracking.slice(0, 50),
       observationArchive: this.observationArchive.slice(0, 500),
       operationArchive: this.operationArchive.slice(0, 500),
-      patternLab: this.patternLabState(),
       observationArchiveCount: this.observationArchive.length,
       updatedAt: new Date().toISOString()
     };
@@ -481,18 +480,46 @@ class SigmaWhiteEngine {
       return null;
     }
 
-    const recent = gaps.slice(-60);
-    const weightTotal = recent.reduce((sum, _, i) => sum + i + 1, 0);
-    const weightedObserved = recent.reduce((sum, g, i) => sum + g * (i + 1), 0) / Math.max(1, weightTotal);
-    const medObserved = median(recent);
-    const expected = weightedObserved * 0.62 + medObserved * 0.38;
-    const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
-    const variance = recent.reduce((a, b) => a + (b - mean) ** 2, 0) / recent.length;
-    const spread = Math.sqrt(variance);
-    const minuteModel = this.minuteWhiteModel(rounds);
-    const recentWhites = rounds.slice(-120).filter(r => r.color === "white").length;
-    const recentDensity = recentWhites / Math.max(1, Math.min(120, rounds.length));
     const weights = this.sensorWeights();
+    const recent30 = gaps.slice(-30);
+    const recent60 = gaps.slice(-60);
+    const last8 = gaps.slice(-8);
+    const currentRounds60 = rounds.slice(-60);
+    const currentRounds30 = rounds.slice(-30);
+    const currentRounds16 = rounds.slice(-16);
+    const whiteCount = list => list.filter(r => r.color === "white").length;
+    const recurring = new Map();
+    gaps.forEach(g => recurring.set(g, (recurring.get(g) || 0) + 1));
+    const topIntervals = [...recurring.entries()]
+      .filter(([, count]) => count >= 5)
+      .sort((a, b) => b[1] - a[1] || a[0] - b[0])
+      .slice(0, 5);
+    const med30 = median(recent30);
+    const pressureGrowing = gaps.length >= 3 && gaps.at(-3) < gaps.at(-2) && gaps.at(-2) < gaps.at(-1);
+
+    const dispersionCluster = (() => {
+      if (last8.length < 5) return false;
+      for (let i = 0; i < last8.length; i += 1) {
+        const base = last8[i];
+        if (last8.filter(v => Math.abs(v - base) <= 4).length >= 5) return true;
+        if (last8.filter(v => Math.abs(v - base) <= 2).length >= 3) return true;
+      }
+      return false;
+    })();
+
+    const minuteWhites = list => {
+      const counts = Array(60).fill(0);
+      list.forEach(r => {
+        if (r.color !== "white") return;
+        const d = new Date(r.createdAt || r.created_at || r.timestamp);
+        if (Number.isNaN(d.getTime())) return;
+        const m = Number(new Intl.DateTimeFormat("en-US", { timeZone: "America/Sao_Paulo", minute: "2-digit" }).format(d));
+        counts[m] += 1;
+      });
+      return counts;
+    };
+    const minuteAll = minuteWhites(rounds);
+    const minuteRecent = minuteWhites(rounds.slice(-1500));
 
     const now = new Date();
     now.setSeconds(0, 0);
@@ -504,112 +531,70 @@ class SigmaWhiteEngine {
       const target = new Date(now.getTime() + minuteOffset * 60000);
       const horizonRounds = minuteOffset * 2;
       const projectedGap = since + horizonRounds;
-      const gapProbability = clamp(0.12 + 0.72 * Math.exp(-Math.abs(projectedGap - expected) / Math.max(5, spread + 3)), 0.06, 0.84);
       const localMinute = Number(new Intl.DateTimeFormat("en-US", { timeZone: "America/Sao_Paulo", minute: "2-digit" }).format(target));
-      const minuteStat = minuteModel[localMinute];
-      const minuteRate = minuteStat.total ? minuteStat.white / minuteStat.total : recentDensity;
-      const minuteProbability = clamp(0.12 + minuteRate * 3.2, 0.08, 0.78);
-      const dispersionProbability = clamp(0.68 - spread / 45, 0.12, 0.72);
-      const densityProbability = clamp(0.16 + recentDensity * 3.0, 0.10, 0.68);
+      const minuteWindow = [(localMinute + 59) % 60, localMinute, (localMinute + 1) % 60];
 
-      // Pressão estatística: mede o quanto o intervalo projetado avançou dentro
-      // da distribuição real dos intervalos entre brancos. Quanto maior o
-      // percentil, maior a pressão, mas sem transformar atraso em certeza.
-      const sortedGaps = [...recent].sort((a, b) => a - b);
-      const pressurePercentile = sortedGaps.filter(g => g <= projectedGap).length / Math.max(1, sortedGaps.length);
-      const pressureProbability = clamp(0.12 + pressurePercentile * 0.66, 0.10, 0.78);
-
+      const intervalActive = topIntervals.some(([gap]) => Math.abs(projectedGap - gap) <= 1);
+      const pressureActive = (projectedGap >= med30 && projectedGap >= 12) || (pressureGrowing && projectedGap >= 15);
+      const densityActive = whiteCount(currentRounds60) <= 1 || (whiteCount(currentRounds30) >= 2 && whiteCount(currentRounds16) === 0);
+      const dispersionActive = dispersionCluster;
+      const minuteActive = minuteWindow.reduce((a, m) => a + minuteAll[m], 0) >= 4 && minuteWindow.reduce((a, m) => a + minuteRecent[m], 0) >= 2;
       const similarity = this.similarityForecast(rounds, since, horizonRounds);
-      const similarityProbability = similarity.probability;
+      const similarityActive = similarity.matches >= 7 && (similarity.hits || 0) >= 3;
       const recurringPattern = this.recurringWhitePatternSensor(rounds, minuteOffset);
-      const patternProbability = recurringPattern.probability;
+      const patternActive = Number(recurringPattern.cases || 0) >= 5 && Number(recurringPattern.hits || 0) >= 3;
 
+      const activeFlags = {
+        gap: intervalActive,
+        pressure: pressureActive,
+        density: densityActive,
+        dispersion: dispersionActive,
+        minute: minuteActive,
+        similarity: similarityActive,
+        patterns: patternActive
+      };
+      const contributions = Object.fromEntries(Object.entries(weights).map(([key, value]) => [key, activeFlags[key] ? value : 0]));
+      const force = Number(Object.values(contributions).reduce((a, b) => a + b, 0).toFixed(2));
+      const activeSensors = Object.values(activeFlags).filter(Boolean).length;
       const components = {
-        gap: { probability: gapProbability },
-        pressure: { probability: pressureProbability, percentile: pressurePercentile },
-        density: { probability: densityProbability },
-        dispersion: { probability: dispersionProbability },
-        minute: { probability: minuteProbability },
-        similarity: { probability: similarityProbability, matches: similarity.matches, confidence: similarity.confidence },
-        patterns: {
-          probability: patternProbability, strength: Number((recurringPattern.strength * 100).toFixed(1)),
-          label: recurringPattern.label, cases: recurringPattern.cases, hits: recurringPattern.hits,
-          hitRate: Number((recurringPattern.hitRate || 0).toFixed(4)), qualified: recurringPattern.qualified,
-          houseHits: recurringPattern.houseHits || [0,0,0,0,0,0],
-          contribution: Number((recurringPattern.strength * weights.patterns).toFixed(3))
-        }
+        gap: { active: intervalActive, strength: intervalActive ? 100 : 0, contribution: contributions.gap, projectedGap, topIntervals },
+        pressure: { active: pressureActive, strength: pressureActive ? 100 : 0, contribution: contributions.pressure, median: med30, growing: pressureGrowing },
+        density: { active: densityActive, strength: densityActive ? 100 : 0, contribution: contributions.density, whites60: whiteCount(currentRounds60), whites30: whiteCount(currentRounds30), whites16: whiteCount(currentRounds16) },
+        dispersion: { active: dispersionActive, strength: dispersionActive ? 100 : 0, contribution: contributions.dispersion, recentIntervals: last8 },
+        minute: { active: minuteActive, strength: minuteActive ? 100 : 0, contribution: contributions.minute, minuteWindow, all3000: minuteWindow.reduce((a,m)=>a+minuteAll[m],0), recent1500: minuteWindow.reduce((a,m)=>a+minuteRecent[m],0) },
+        similarity: { active: similarityActive, strength: similarityActive ? 100 : 0, contribution: contributions.similarity, matches: similarity.matches, hits: similarity.hits || 0 },
+        patterns: { active: patternActive, strength: patternActive ? 100 : 0, contribution: contributions.patterns, label: recurringPattern.label, cases: recurringPattern.cases, hits: recurringPattern.hits, houseHits: recurringPattern.houseHits || [0,0,0,0,0,0] }
       };
-      const rawNormalized = {
-        gap: this.normalizeSensor(gapProbability, 0.06, 0.84),
-        pressure: this.normalizeSensor(pressureProbability, 0.10, 0.78),
-        density: this.normalizeSensor(densityProbability, 0.10, 0.68),
-        dispersion: this.normalizeSensor(dispersionProbability, 0.12, 0.72),
-        minute: this.normalizeSensor(minuteProbability, 0.08, 0.78),
-        similarity: this.normalizeSensor(similarityProbability, 0.05, 0.92),
-        patterns: recurringPattern.strength
-      };
-      const normalized = Object.fromEntries(
-        Object.entries(rawNormalized).map(([key, value]) => [key, this.calibratedSensorStrength(value)])
-      );
-      Object.entries(normalized).forEach(([key, strength]) => {
-        components[key].strength = Number((strength * 100).toFixed(1));
-      });
-      const favorableSensors = Object.values(normalized).filter(v => v >= 0.60).length;
-      const baseForce = (
-        normalized.gap * weights.gap +
-        normalized.pressure * weights.pressure +
-        normalized.density * weights.density +
-        normalized.dispersion * weights.dispersion +
-        normalized.minute * weights.minute +
-        normalized.similarity * weights.similarity +
-        normalized.patterns * weights.patterns
-      );
-      const alignmentBonus = this.alignmentBonus(normalized);
-      const force = clamp(baseForce + alignmentBonus, 0, 10);
-      const contributions = Object.fromEntries(Object.keys(weights).map(key => [key, Number((normalized[key] * weights[key]).toFixed(3))]));
-      contributions.alignment = Number(alignmentBonus.toFixed(2));
-      const probability = clamp(force / 10, 0.05, 0.98);
 
       const targetMs = target.getTime();
       const candidate = {
-        id: `server-white-v3-${targetMs}`,
-        engineVersion: "BRANCO_V6_FORCA_RECALIBRADA",
+        id: `server-white-v2-${targetMs}`,
+        engineVersion: "BRANCO_V2_BINARY_SENSORS",
         targetAt: target.toISOString(), createdAt: new Date().toISOString(),
-        force: Number(force.toFixed(2)), score: Math.round(force * 10),
-        signalTier: this.signalTier(force), probability: Number(probability.toFixed(4)), expectedGap: Math.round(expected), sinceAtProjection: since,
-        status: "WAITING", classification: force >= this.minimumForce() ? "ACTIVE" : "OBSERVATION",
+        force, score: null, activeSensors,
+        signalTier: "BINARY", probability: null, expectedGap: null, sinceAtProjection: since,
+        status: "WAITING", classification: force > this.minimumForce() ? "ACTIVE" : "OBSERVATION",
         windowStartAt: new Date(targetMs - 60000).toISOString(),
         windowEndAt: new Date(targetMs + 120000).toISOString(), processedHouses: 0,
         sampleQuality: gaps.length >= 40 ? "FULL" : gaps.length >= 12 ? "MODERATE" : "LOW",
-        intervalsUsed: gaps.length, favorableSensors, components, sensorWeights: weights, contributions, rawStrengths: rawNormalized, alignmentBonus, baseForce: Number(baseForce.toFixed(2)),
-        reasons: [
-          `Padrão ativo: ${recurringPattern.label}; ${recurringPattern.cases} ocorrências, ${(patternProbability * 100).toFixed(0)}% de branco até C6; contribuição ${(recurringPattern.strength * weights.patterns).toFixed(2)}/${weights.patterns.toFixed(1)}.`,
-          `Similaridade contextual: ${similarity.matches} cenários; chance histórica ${(similarityProbability * 100).toFixed(0)}% (bônus máximo 0,5).`,
-          `Força integrada: ${force.toFixed(2)}/10,0 (base ${baseForce.toFixed(2)} + alinhamento ${alignmentBonus.toFixed(2)}; mínimo ${this.minimumForce().toFixed(1)}).`,
-          `Intervalo projetado ${projectedGap}; referência ${Math.round(expected)}.`,
-          `Pressão estatística: percentil ${(pressurePercentile * 100).toFixed(0)}%.`,
-          `Minuto ${String(localMinute).padStart(2, "0")}: taxa ajustada ${(minuteProbability * 100).toFixed(0)}%.`,
-          `Fontes favoráveis: ${favorableSensors}/7; decisão feita pela força integrada.`,
-          `Aprendizado contínuo: ${this.learning.operations || 0} operações avaliadas.`
-        ]
+        intervalsUsed: gaps.length, favorableSensors: activeSensors, components, sensorWeights: weights, contributions,
+        reasons: Object.entries(activeFlags).map(([key, active]) => `${key}: ${active ? "ATIVO" : "INATIVO"} (+${active ? weights[key].toFixed(1) : "0,0"})`).concat([`Soma: ${force.toFixed(1)} / 10,0; corte: > ${this.minimumForce().toFixed(1)}`])
       };
       if (!best || candidate.force > best.force || (candidate.force === best.force && targetMs < new Date(best.targetAt).getTime())) best = candidate;
     }
+
     this.whiteDebug = {
       evaluated,
-      bestScore: best?.score ?? null,
+      bestScore: null,
       bestForce: best?.force ?? null,
-      bestVotes: best?.favorableSensors ?? null,
+      bestVotes: best?.activeSensors ?? null,
       bestTargetAt: best?.targetAt ?? null,
       bestClassification: best?.classification ?? null,
-      bestPattern: best?.components?.patterns || null,
       lastEvaluationAt: new Date().toISOString(),
       status: best ? (best.classification === "ACTIVE" ? "SIGNAL_READY" : "OBSERVING") : "NO_CANDIDATE",
       minimumForce: this.minimumForce(),
-      rule: `Força integrada ${this.minimumForce().toFixed(1)}+ em escala de 0 a 10, incluindo padrões recorrentes`
+      rule: `Sensores binários; soma > ${this.minimumForce().toFixed(1)}`
     };
-    // Mantém sempre o melhor candidato visível em observação, mesmo com score baixo.
-    // A publicação no Telegram continua restrita às regras de score e consenso.
     return best || null;
   }
   async ensureProjection(forceRefresh = false) {
@@ -834,24 +819,20 @@ class SigmaWhiteEngine {
     };
   }
   async sendHourlySummary(now = new Date()) {
-    const p = this.saoPauloParts(now);
-    const end = this.localBoundaryToUtc({ year: p.year, month: p.month, day: p.day, hour: p.hour, minute: 0 });
-    const start = new Date(end.getTime() - 60 * 60 * 1000);
+    const end = new Date(now);
+    const start = new Date(end.getTime() - 3 * 60 * 60 * 1000);
     const stats = this.periodStats(start, end);
     const startLabel = fmtTime(start);
     const endLabel = fmtTime(new Date(end.getTime() - 1000));
-    const houseLine = stats.capturedWhites ? `
-🏠 Capturas: C1 ${stats.houseCaptures[0]} • C2 ${stats.houseCaptures[1]} • C3 ${stats.houseCaptures[2]} • C4 ${stats.houseCaptures[3]} • C5 ${stats.houseCaptures[4]} • C6 ${stats.houseCaptures[5]}` : "";
-    await this.sendTelegram(`📊 SIGMA ⚪ BRANCO • RESUMO DA HORA
+    await this.sendTelegram(`📊 SIGMA ⚪ BRANCO • RESUMO 3 HORAS
 
 🕒 Período: ${startLabel} às ${endLabel}
 📡 Operações finalizadas: ${stats.signals}
 ⚪ Brancos capturados: ${stats.capturedWhites}
 ✅ Operações com branco: ${stats.payingOperations}
 ❌ Operações sem branco: ${stats.losses}
-⚪ Brancos reais no período: ${stats.realWhites}${houseLine}
-🎯 Média: ${stats.captureRate.toFixed(2).replace(".", ",")} branco/operação
-📈 Cobertura dos brancos do período: ${stats.coverage.toFixed(1).replace(".", ",")}%`);
+⚪ Brancos reais no período: ${stats.realWhites}
+🎯 Média: ${stats.captureRate.toFixed(2).replace(".", ",")} branco/operação`);
   }
   forceBucket(force) {
     if (force >= 8.5) return "8,5+";
@@ -863,8 +844,8 @@ class SigmaWhiteEngine {
   }
   async sendDailySummary(now = new Date()) {
     const p = this.saoPauloParts(now);
-    const start = this.localBoundaryToUtc({ year: p.year, month: p.month, day: p.day, hour: 0, minute: 0 });
-    const end = new Date(now.getTime() + 1000);
+    const end = this.localBoundaryToUtc({ year: p.year, month: p.month, day: p.day, hour: 0, minute: 0 });
+    const start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
     const stats = this.periodStats(start, end);
     const operations = this.operationArchive.filter(op => {
       const t = new Date(op.resolvedAt || op.createdAt).getTime();
@@ -886,7 +867,7 @@ class SigmaWhiteEngine {
     const patternText = Object.keys(patterns).length ? Object.entries(patterns).map(([k,v]) => `${k.replace("BRANCO PAGO • ", "")}: ${v}`).join(" • ") : "Nenhum múltiplo";
     const text = `📈 SIGMA ⚪ BRANCO • FECHAMENTO DO DIA
 
-📅 Data: ${p.day}/${p.month}/${p.year}
+📅 Data: ${new Intl.DateTimeFormat("pt-BR", { timeZone: "America/Sao_Paulo" }).format(new Date(end.getTime() - 1000))}
 📡 Operações finalizadas: ${stats.signals}
 ⚪ Brancos capturados nas operações: ${stats.capturedWhites}
 ✅ Operações com pelo menos 1 branco: ${stats.payingOperations}
@@ -922,22 +903,22 @@ ${sensorLine(losses)}`;
     if (!this.enabled || !this.telegramToken || !this.telegramChatId) return;
     const now = new Date();
     const p = this.saoPauloParts(now);
-    const minute = Number(p.minute);
-    const second = Number(p.second);
+    const hour = Number(p.hour), minute = Number(p.minute), second = Number(p.second);
 
-    if (minute === 0 && second < 45) {
-      const key = this.localHourKey(now);
+    if (hour > 0 && hour % 3 === 0 && minute === 0 && second < 45) {
+      const key = `${this.localDateKey(now)}T${String(hour).padStart(2,"0")}`;
       if (this.lastHourlySummaryKey !== key) {
         this.lastHourlySummaryKey = key;
-      this.saveHistoryState();
+        this.saveHistoryState();
         await this.sendHourlySummary(now);
       }
     }
 
-    if (Number(p.hour) === 23 && minute === 59 && second < 45) {
-      const key = this.localDateKey(now);
-      if (this.lastDailySummaryKey !== key) {
-        this.lastDailySummaryKey = key;
+    if (hour === 0 && minute >= 1 && minute <= 10) {
+      const previousDay = this.localDateKey(new Date(now.getTime() - 60 * 60 * 1000));
+      if (!this.active && this.lastDailySummaryKey !== previousDay) {
+        this.lastDailySummaryKey = previousDay;
+        this.saveHistoryState();
         await this.sendDailySummary(now);
       }
     }
@@ -980,9 +961,7 @@ ${sensorLine(losses)}`;
     await this.sendTelegram(`Σ SIGMA LEITURA • ⚪️ BRANCO
 
 ⏰ Horário central: ${fmtTime(operation.targetAt)}
-🕒 Janela: ${fmtTime(operation.windowStartAt)} até ${fmtTime(new Date(new Date(operation.targetAt).getTime() + 60000))}
-
-⚡️ Força: ${Number(operation.force || 0).toFixed(2).replace(".", ",")} / 10,0`);
+🕒 Janela: ${fmtTime(operation.windowStartAt)} até ${fmtTime(new Date(new Date(operation.targetAt).getTime() + 60000))}`);
   }
   async sendResult(operation) {
     if (operation.status === "WIN") {
